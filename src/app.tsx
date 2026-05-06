@@ -544,6 +544,9 @@ function App({
   const [tasksStartedAt, setTasksStartedAt] = useState<number | null>(null);
   const [tasksStartTokens, setTasksStartTokens] = useState<number>(0);
   const [turnStartedAt, setTurnStartedAt] = useState<number | null>(null);
+  const [turnPhase, setTurnPhase] = useState<import("./ui/status.js").TurnPhase>("waiting");
+  const [currentToolName, setCurrentToolName] = useState<string | null>(null);
+  const [lastActivityAt, setLastActivityAt] = useState<number | null>(null);
   const [verbose, setVerbose] = useState(false);
   const [hasUpdate, setHasUpdate] = useState(initialUpdateResult?.hasUpdate ?? false);
   const [latestVersion, setLatestVersion] = useState<string | null>(initialUpdateResult?.latestVersion ?? null);
@@ -1580,6 +1583,9 @@ function App({
     } finally {
       setBusy(false);
       setTurnStartedAt(null);
+      setTurnPhase("waiting");
+      setCurrentToolName(null);
+      setLastActivityAt(null);
       activeControllerRef.current = null;
       permResolveRef.current = null;
       limitResolveRef.current = null;
@@ -1831,6 +1837,9 @@ function App({
       if (asstId !== null) updateAssistant(asstId, () => ({ streaming: false }));
       setBusy(false);
       setTurnStartedAt(null);
+      setTurnPhase("waiting");
+      setCurrentToolName(null);
+      setLastActivityAt(null);
       activeAsstIdRef.current = null;
       activeControllerRef.current = null;
       permResolveRef.current = null;
@@ -2842,6 +2851,8 @@ function App({
         onAssistantStart: () => {
           const id = nextAssistantId++;
           activeAsstIdRef.current = id;
+          setTurnPhase("generating");
+          setLastActivityAt(Date.now());
           setEvents((e) => [
             ...e,
             { kind: "assistant", key: `asst_${id}`, id, text: "", reasoning: "", streaming: true },
@@ -2850,17 +2861,23 @@ function App({
         onReasoningDelta: (d: string) => {
           const id = activeAsstIdRef.current;
           if (id !== null) updateAssistant(id, (e) => ({ reasoning: e.reasoning + d }));
+          setLastActivityAt(Date.now());
         },
         onTextDelta: (d: string) => {
           const id = activeAsstIdRef.current;
           if (id !== null) updateAssistant(id, (e) => ({ text: e.text + d }));
+          setLastActivityAt(Date.now());
         },
         onAssistantFinal: () => {
           const id = activeAsstIdRef.current;
           if (id !== null) updateAssistant(id, () => ({ streaming: false }));
+          setTurnPhase("waiting");
         },
         onToolCallFinalized: (call: import("./agent/messages.js").ToolCall) => {
           pendingToolCallsRef.current.set(call.id, call.function.name);
+          setTurnPhase("executing");
+          setCurrentToolName(call.function.name);
+          setLastActivityAt(Date.now());
           const spec = executorRef.current.list().find((t) => t.name === call.function.name);
           let renderMeta: ToolRender | undefined;
           let argsParsed: Record<string, unknown> = {};
@@ -2887,11 +2904,17 @@ function App({
               status: "running",
               render: renderMeta,
               expanded: false,
+              startedAt: Date.now(),
             },
           ]);
         },
         onToolResult: (r: import("./tools/executor.js").ToolResult) => {
           pendingToolCallsRef.current.delete(r.tool_call_id);
+          setLastActivityAt(Date.now());
+          if (pendingToolCallsRef.current.size === 0) {
+            setTurnPhase("waiting");
+            setCurrentToolName(null);
+          }
           updateTool(r.tool_call_id, {
             status: r.ok ? "done" : "error",
             result: r.content,
@@ -3152,6 +3175,9 @@ function App({
         if (asstId !== null) updateAssistant(asstId, () => ({ streaming: false }));
         setBusy(false);
         setTurnStartedAt(null);
+        setTurnPhase("waiting");
+        setCurrentToolName(null);
+        setLastActivityAt(null);
         activeAsstIdRef.current = null;
         activeControllerRef.current = null;
         permResolveRef.current = null;
@@ -3514,6 +3540,9 @@ function App({
               codeMode={codeMode}
               cloudMode={cfg.cloudMode}
               cloudBudget={cloudBudget}
+              phase={turnPhase}
+              currentTool={currentToolName}
+              lastActivityAt={lastActivityAt}
               kimiMdStale={kimiMdStale}
             />
             {activePicker?.kind === "file" && (
