@@ -10,8 +10,25 @@ export interface SessionSummary {
   filePath: string;
   cwd: string;
   firstPrompt: string;
+  /** Human-readable title generated from first prompt and intent. */
+  title?: string;
   messageCount: number;
   updatedAt: string;
+  checkpointCount: number;
+}
+
+export interface Checkpoint {
+  /** Unique checkpoint ID */
+  id: string;
+  /** Human-readable label */
+  label: string;
+  /** Index into messages array where checkpoint was taken */
+  turnIndex: number;
+  timestamp: string;
+  /** Snapshot of session state at checkpoint time */
+  sessionState?: SessionState;
+  /** Snapshot of artifact store at checkpoint time */
+  artifactStore?: SerializedArtifact[];
 }
 
 export interface SessionFile {
@@ -21,13 +38,17 @@ export interface SessionFile {
   createdAt: string;
   updatedAt: string;
   messages: ChatMessage[];
+  /** Human-readable title generated from first prompt and intent. */
+  title?: string;
   /** Compiled session state for token-optimized context (optional). */
   sessionState?: SessionState;
   /** Persisted artifact store for recalled raw tool outputs (optional). */
   artifactStore?: SerializedArtifact[];
+  /** User-created checkpoints within this session (optional). */
+  checkpoints?: Checkpoint[];
 }
 
-function sessionsDir(): string {
+export function sessionsDir(): string {
   const xdg = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
   return join(xdg, "kimiflare", "sessions");
 }
@@ -38,6 +59,31 @@ function sanitize(text: string): string {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 40);
+}
+
+const INTENT_PREFIX_MAP: Record<string, string> = {
+  diagnose: "Bug:",
+  feature_bounded: "Feature:",
+  feature_exploratory: "Feature:",
+  polish: "Refactor:",
+  meta: "Plan:",
+  explore: "Explore:",
+  qa: "Q&A:",
+  verify: "Verify:",
+  small_edit: "Edit:",
+  default: "Task:",
+};
+
+/** Generate a short human-readable title from the first user prompt. */
+export function generateSessionTitle(firstPrompt: string, intent: string): string {
+  const prefix = INTENT_PREFIX_MAP[intent] ?? INTENT_PREFIX_MAP.default;
+  const cleaned = firstPrompt
+    .replace(/\s+/g, " ")
+    .replace(/[\n\r]/g, " ")
+    .trim();
+  const words = cleaned.split(" ").slice(0, 6).join(" ");
+  const title = `${prefix} ${words}`;
+  return title.length > 40 ? title.slice(0, 37) + "..." : title;
 }
 
 export function makeSessionId(firstPrompt: string): string {
@@ -90,8 +136,10 @@ export async function listSessions(limit = 30, cwd?: string): Promise<SessionSum
         filePath: path,
         cwd: parsed.cwd,
         firstPrompt: firstPrompt.slice(0, 80),
+        title: parsed.title,
         messageCount: parsed.messages.filter((m) => m.role !== "system").length,
         updatedAt: parsed.updatedAt ?? s.mtime.toISOString(),
+        checkpointCount: parsed.checkpoints?.length ?? 0,
       });
     } catch {
       /* skip unreadable */
@@ -104,4 +152,38 @@ export async function listSessions(limit = 30, cwd?: string): Promise<SessionSum
 export async function loadSession(filePath: string): Promise<SessionFile> {
   const raw = await readFile(filePath, "utf8");
   return JSON.parse(raw) as SessionFile;
+}
+
+/** Add a checkpoint to an existing session file. */
+export async function addCheckpoint(
+  filePath: string,
+  checkpoint: Checkpoint,
+): Promise<void> {
+  const file = await loadSession(filePath);
+  if (!file.checkpoints) file.checkpoints = [];
+  file.checkpoints.push(checkpoint);
+  await saveSession(file);
+}
+
+/** Load a session and truncate to a specific checkpoint. */
+export async function loadSessionFromCheckpoint(
+  filePath: string,
+  checkpointId: string,
+): Promise<{ file: SessionFile; checkpoint: Checkpoint }> {
+  const file = await loadSession(filePath);
+  const checkpoint = file.checkpoints?.find((c) => c.id === checkpointId);
+  if (!checkpoint) {
+    throw new Error(`checkpoint ${checkpointId} not found`);
+  }
+  // Truncate messages to checkpoint turn index
+  const truncated = file.messages.slice(0, checkpoint.turnIndex);
+  return {
+    file: {
+      ...file,
+      messages: truncated,
+      sessionState: checkpoint.sessionState ?? file.sessionState,
+      artifactStore: checkpoint.artifactStore ?? file.artifactStore,
+    },
+    checkpoint,
+  };
 }
