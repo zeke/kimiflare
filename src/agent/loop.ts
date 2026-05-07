@@ -10,6 +10,7 @@ import { logTurnDebug, analyzePrompt } from "../cost-debug.js";
 import { EXTRACTORS } from "../memory/extractors.js";
 import { stripHistoricalReasoning } from "./strip-reasoning.js";
 import { generateTypeScriptApi, runInSandbox } from "../code-mode/index.js";
+import { estimatePromptTokens } from "./compaction.js";
 import { logger } from "../util/logger.js";
 
 export interface AgentCallbacks {
@@ -101,6 +102,14 @@ function isHighSignalMemory(memory: {
     (memory.category === "event" && memory.importance >= 3)
   );
 }
+
+/** Hard ceiling for prompt tokens before we refuse to call the API.
+ *  Leaves ~22k tokens of headroom below the 262,144 context window. */
+const MAX_PROMPT_TOKENS = 240_000;
+
+/** Max characters for a single tool result message before truncation.
+ *  ~10k chars ≈ 2,500 tokens — generous but prevents runaway growth. */
+const MAX_TOOL_CONTENT_CHARS = 10_000;
 
 export async function runAgentTurn(opts: AgentTurnOpts): Promise<void> {
   const turnStart = performance.now();
@@ -260,6 +269,14 @@ export async function runAgentTurn(opts: AgentTurnOpts): Promise<void> {
 
     if (opts.keepLastImageTurns !== undefined) {
       apiMessages = stripOldImages(apiMessages, opts.keepLastImageTurns);
+    }
+
+    const promptTokens = estimatePromptTokens(apiMessages);
+    if (promptTokens > MAX_PROMPT_TOKENS) {
+      throw new Error(
+        `kimiflare: context window exceeded (~${promptTokens.toLocaleString()} tokens). ` +
+          `Run /compact to summarize older turns, or /clear to start fresh.`,
+      );
     }
 
     logger.debug("turn:api_request", { sessionId: opts.sessionId, messageCount: apiMessages.length });
@@ -493,9 +510,14 @@ export async function runAgentTurn(opts: AgentTurnOpts): Promise<void> {
         const warningPrefix = sandboxResult.warnings?.length
           ? `Warning: ${sandboxResult.warnings.join(" ")}\n\n`
           : "";
-        const resultContent = sandboxResult.error
+        let resultContent = sandboxResult.error
           ? `${warningPrefix}Error: ${sandboxResult.error}\n\nOutput:\n${sandboxResult.output}`
           : `${warningPrefix}${sandboxResult.output}`;
+        if (resultContent.length > MAX_TOOL_CONTENT_CHARS) {
+          resultContent =
+            resultContent.slice(0, MAX_TOOL_CONTENT_CHARS) +
+            `\n\n[truncated: ${resultContent.length - MAX_TOOL_CONTENT_CHARS} chars omitted]`;
+        }
 
         const result: ToolResult = {
           tool_call_id: tc.id,
@@ -521,12 +543,18 @@ export async function runAgentTurn(opts: AgentTurnOpts): Promise<void> {
           { cwd: opts.cwd, signal: opts.signal, onTasks: opts.callbacks.onTasks, coauthor: opts.coauthor, memoryManager: opts.memoryManager, sessionId: opts.sessionId, githubToken: opts.githubToken },
           opts.onFileChange,
         );
+        let content = result.content;
+        if (content.length > MAX_TOOL_CONTENT_CHARS) {
+          content =
+            content.slice(0, MAX_TOOL_CONTENT_CHARS) +
+            `\n\n[truncated: ${content.length - MAX_TOOL_CONTENT_CHARS} chars omitted]`;
+        }
         logger.debug("turn:tool_end", { sessionId: opts.sessionId, tool: tc.function.name, toolCallId: tc.id, ok: result.ok });
         toolResults.push(result);
         opts.messages.push({
           role: "tool",
           tool_call_id: result.tool_call_id,
-          content: sanitizeString(result.content),
+          content: sanitizeString(content),
           name: result.name,
         });
         opts.callbacks.onToolResult?.(result);
