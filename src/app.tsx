@@ -603,6 +603,24 @@ function App({
     );
   }, []);
 
+  // Register a SIGINT handler so Ctrl+C still works when the terminal is not
+  // in raw mode (e.g. after a child process modified terminal state). The
+  // handler delegates to the same logic as the useInput Ctrl+C handler.
+  // This is different from the previous attempt (c6e9c1f) which unconditionally
+  // called exit() and caused screen flashing by conflicting with useInput.
+  useEffect(() => {
+    const onSigint = () => {
+      logger.info("sigint:fired", {
+        hasHandler: sigintHandlerRef.current !== null,
+      });
+      sigintHandlerRef.current?.();
+    };
+    process.on("SIGINT", onSigint);
+    return () => {
+      process.off("SIGINT", onSigint);
+    };
+  }, []);
+
   // Load user and project themes at startup
   useEffect(() => {
     let cancelled = false;
@@ -659,6 +677,8 @@ function App({
   const supervisorRef = useRef<TurnSupervisor>(new TurnSupervisor());
   const isAbortingRef = useRef(false);
   const lastEscapeAtRef = useRef(0);
+  /** Holds the latest Ctrl+C interrupt logic so the SIGINT handler can delegate to it. */
+  const sigintHandlerRef = useRef<(() => void) | null>(null);
   const permResolveRef = useRef<((d: PermissionDecision) => void) | null>(null);
   const limitResolveRef = useRef<((d: LimitDecision) => void) | null>(null);
   const pendingToolCallsRef = useRef<Map<string, string>>(new Map());
@@ -1430,6 +1450,13 @@ function App({
 
   useInput((inputChar, key) => {
     if (key.ctrl && inputChar === "c") {
+      logger.info("input:ctrl+c", {
+        busy: busyRef.current,
+        hasActiveScope: activeScopeRef.current !== null,
+        isAborting: isAbortingRef.current,
+        hasPerm: permResolveRef.current !== null,
+        hasLimit: limitResolveRef.current !== null,
+      });
       const hadPerm = permResolveRef.current !== null;
       const hadLimit = limitResolveRef.current !== null;
       if (hadPerm) {
@@ -1456,6 +1483,7 @@ function App({
         setTasksStartTokens(0);
         tasksRef.current = [];
       } else if (!hadPerm && !hadLimit) {
+        logger.info("input:ctrl+c:exiting");
         void lspManagerRef.current.stopAll().finally(() => exit());
       }
       return;
@@ -1510,6 +1538,46 @@ function App({
       return;
     }
   });
+
+  // Keep the SIGINT handler in sync with the latest state/refs so that when
+  // the terminal sends a real SIGINT (bypassing Ink raw mode) we can still
+  // interrupt the turn or exit gracefully.
+  sigintHandlerRef.current = () => {
+    logger.info("sigint:handler", {
+      busy: busyRef.current,
+      hasActiveScope: activeScopeRef.current !== null,
+      isAborting: isAbortingRef.current,
+      hasPerm: permResolveRef.current !== null,
+      hasLimit: limitResolveRef.current !== null,
+    });
+    const hadPerm = permResolveRef.current !== null;
+    const hadLimit = limitResolveRef.current !== null;
+    if (hadPerm) {
+      permResolveRef.current!("deny");
+      permResolveRef.current = null;
+      setPerm(null);
+    }
+    if (hadLimit) {
+      limitResolveRef.current!("stop");
+      limitResolveRef.current = null;
+      setLimitModal(null);
+    }
+    if (busyRef.current && activeScopeRef.current && !isAbortingRef.current) {
+      isAbortingRef.current = true;
+      supervisorRef.current.killTurn();
+      activeScopeRef.current.abort("user_stopped");
+      setQueue([]);
+      setEvents((e) => [...e, { kind: "info", key: mkKey(), text: "(interrupted)" }]);
+      void saveSessionSafe();
+      setTasks([]);
+      setTasksStartedAt(null);
+      setTasksStartTokens(0);
+      tasksRef.current = [];
+    } else if (!hadPerm && !hadLimit) {
+      logger.info("sigint:handler:exiting");
+      void lspManagerRef.current.stopAll().finally(() => exit());
+    }
+  };
 
   const flushAssistantUpdates = useCallback(() => {
     flushTimeoutRef.current = null;
@@ -1661,6 +1729,7 @@ function App({
         ]);
       }
     } finally {
+      logger.info("runCompact:finally");
       setBusy(false);
       busyRef.current = false;
       setTurnStartedAt(null);
@@ -1668,6 +1737,7 @@ function App({
       setCurrentToolName(null);
       setLastActivityAt(null);
       activeScopeRef.current = null;
+      isAbortingRef.current = false;
       permResolveRef.current = null;
       limitResolveRef.current = null;
       pendingToolCallsRef.current.clear();
@@ -1941,6 +2011,7 @@ function App({
         ]);
       }
     } finally {
+      logger.info("runInit:finally");
       setCodeMode(false);
       const asstId = activeAsstIdRef.current;
       if (asstId !== null) updateAssistant(asstId, () => ({ streaming: false }));
@@ -1952,6 +2023,7 @@ function App({
       setLastActivityAt(null);
       activeAsstIdRef.current = null;
       activeScopeRef.current = null;
+      isAbortingRef.current = false;
       permResolveRef.current = null;
       limitResolveRef.current = null;
       pendingToolCallsRef.current.clear();
@@ -3377,6 +3449,7 @@ function App({
       };
 
       const cleanupTurn = () => {
+        logger.info("cleanupTurn");
         setCodeMode(false);
         const asstId = activeAsstIdRef.current;
         if (asstId !== null) updateAssistant(asstId, () => ({ streaming: false }));
