@@ -1887,6 +1887,16 @@ function App({
             const isDenied = typeof r.content === "string" && r.content.startsWith("Permission denied");
             updateTool(r.tool_call_id, { status: isDenied ? "rejected" : r.ok ? "done" : "error", result: r.content });
           },
+          onWarning: (msg) => {
+            setEvents((e) => [
+              ...e,
+              {
+                kind: "info",
+                key: mkKey(),
+                text: msg,
+              },
+            ]);
+          },
           onUsage: (u) => {
             usageRef.current = u;
             setUsage(u);
