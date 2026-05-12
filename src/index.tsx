@@ -207,7 +207,7 @@ async function main() {
     }
 
     cfg = {
-      ...(cfg ?? { accountId: "", apiToken: "", model: DEFAULT_MODEL, memoryEnabled: true }),
+      ...(cfg ?? { accountId: "", apiToken: "", model: DEFAULT_MODEL, memoryEnabled: false }),
       cloudMode: true,
     };
   }
