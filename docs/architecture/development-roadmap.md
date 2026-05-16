@@ -15,6 +15,28 @@ Most-recent-first. When an item ships, move it here in one line so a
 fresh session can pick up where the last one left off without
 re-reading the full roadmap.
 
+- **M1.10** — Per-session sandbox fallback warning *(OP-10 / RF-19)*
+  — *(this PR)*. Replaces the per-process `fallbackWarningShown`
+  flag in `src/code-mode/sandbox.ts` with a per-session `Set<string>`
+  keyed by `ctx.sessionId`. SDK embeddings that spawn multiple
+  sessions in one process now see the warning on each new session.
+- **M1.1** — Full-jitter retry backoff *(OP-1 / RF-8)* — *(this
+  PR)*. `src/agent/client.ts` retries (both the network-error branch
+  and the API-error branch) now use
+  `Math.random() * (baseDelay * 2 ** attempt)` instead of
+  `baseDelay * 2 ** attempt + Math.random() * 250`. Spreads
+  retries across a wider window during thundering-herd scenarios.
+- **M3.2 + M3.3** — LSP per-request timeout and auto-restart on
+  crash — merged in #422 *(adds `LspServerConfig.timeoutMs` and
+  `maxRestartAttempts`; subscribes to the connection's `exit` event;
+  full-jitter exponential backoff capped at 10s, default 3 attempts;
+  ignores clean exits and explicit stops; surfaces `restartAttempts`
+  on `LspServerStatus`; 7 unit tests via an `LspManagerHooks` test
+  seam)*.
+- **M3.1** — MCP per-call timeout for tool invocations — merged in
+  #421 *(wraps `client.callTool` with configurable timeout, default
+  60s; adds `McpServerConfig.timeoutMs` and threads it through
+  `mcpToolToSpec`; local `withTimeout` helper; 5 unit tests)*.
 - **M4.1** — `PermissionController` extracted from `app.tsx` —
   merged in #419 *(app.tsx 4,393 → 4,334 LOC, hook + 11 tests added,
   pure refactor, behavior preserved including the
@@ -110,9 +132,10 @@ batching.
   aborting` *(RF-20)* — **user-flagged urgent**. One-line guard at
   top of SIGINT handler. Closes the long-standing "Ctrl+C freezes
   the session" bug. Should land first.
-- **M1.1** — `fix(client): full-jitter retry backoff` *(OP-1 / RF-8)*
-  - `src/agent/client.ts:116` → `random(0, 500 * 2^attempt)`.
-  - Unit test: 5 retries don't fall into a sub-300ms window.
+- ✅ **M1.1** — `fix(client): full-jitter retry backoff` *(OP-1 /
+  RF-8)* — *shipped in this PR*. Both retry sites in
+  `src/agent/client.ts` (network-error and API-error branches) now
+  use `Math.random() * (baseDelay * 2 ** attempt)`.
 - **M1.2** — `feat(session-state): size-aware artifact eviction`
   *(OP-2 / RF-9)*
   - `src/agent/session-state.ts:82–88` — evict largest among oldest
@@ -149,10 +172,10 @@ batching.
     trigger at 3 high-signal memories.
 - **M1.9** — `fix(loop): zero-tool-call budget check` *(OP-9 / RF-5)*
   - `loop.ts:530–574` — drop the `toolCalls.length > 0` guard.
-- **M1.10** — `fix(code-mode): per-session fallback warning`
-  *(OP-10 / RF-19)*
-  - `src/code-mode/sandbox.ts` — track warning state per session,
-    not per process.
+- ✅ **M1.10** — `fix(code-mode): per-session fallback warning`
+  *(OP-10 / RF-19)* — *shipped in this PR*. `fallbackWarningShown`
+  boolean replaced with a `Set<sessionId>`; new sessions in the
+  same process re-see the warning.
 
 **Exit criteria:** All 10 PRs merged; one minor release cut by
 release-please.
@@ -192,22 +215,32 @@ test regressions.
 
 **PRs:**
 
-- **M3.1** — `feat(mcp): per-call timeouts` *(OP-15 / RF-16)*
-  - Default 60 s per tool invocation; configurable per server.
-  - On timeout, return `ToolError { code: "TIMEOUT", recoverable: true }`.
-- **M3.2** — `feat(lsp): per-call timeouts` *(OP-15 / RF-16)*
-  - Default 10 s. Faster fallback than MCP because LSP ops are
-    usually local.
-- **M3.3** — `feat(lsp): auto-restart with backoff` *(OP-16 / RF-15)*
-  - Increment `restartAttempts` on exit. Backoff: 1s, 4s, 16s, then
-    surface failure.
-  - Show attempt state in `/lsp status`.
+- ✅ **M3.1** — `feat(mcp): per-call timeouts` *(OP-15 / RF-16)* —
+  *merged in #421*. Default 60 s per tool invocation; configurable
+  per server via `McpServerConfig.timeoutMs`. On timeout, surfaces a
+  labeled `Error` (`MCP request '<server>/<tool>' timed out after
+  Nms`) — the structured `ToolError { code: "TIMEOUT", recoverable:
+  true }` upgrade is deferred to M2.1.
+- ✅ **M3.2** — `feat(lsp): per-call timeouts` *(OP-15 / RF-16)* —
+  *merged in #422*. Default 10 s (existing hardcoded value, now
+  configurable per server via `LspServerConfig.timeoutMs`). Threads
+  into `LspConnection`.
+- ✅ **M3.3** — `feat(lsp): auto-restart with backoff` *(OP-16 /
+  RF-15)* — *merged in #422*. Subscribes to the connection's `exit`
+  event; full-jitter exponential backoff (`500 ms * 2^attempt`,
+  capped at 10 s) up to `maxRestartAttempts` (default 3, set 0 to
+  disable). Clean exits (`code === 0`) and explicit `stopServer` do
+  not trigger restarts. `restartAttempts` now surfaced on
+  `LspServerStatus`. A `/lsp status` slash command remains to be
+  built — deferred because it touches `app.tsx` and would conflict
+  with M4 extractions.
 - **M3.4** — `feat(tools): streaming read for large files`
   *(RF-13, second half)*
   - Stream-read past, say, 1 MB. Check `signal` between chunks.
 
 **Exit criteria:** Hung MCP server scenario from RF-16 verified
 fixed by a regression test (mock server that never responds).
+M3.4 remains; M3.1–M3.3 shipped.
 
 ---
 

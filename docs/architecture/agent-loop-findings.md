@@ -107,7 +107,7 @@ first-byte.
 **Fix:** expose `idleTimeoutMs` on the call options. Bonus: once the first
 data byte arrives, drop the idle timeout to 30 s — the model is alive.
 
-### RF-8 — Retry backoff has weak jitter (S)
+### RF-8 — Retry backoff has weak jitter (S) — ✅ shipped (M1.1)
 
 `src/agent/client.ts:116`, `500 * 2^attempt + random(0..250)`.
 
@@ -116,6 +116,9 @@ AI), all clients retry on nearly identical schedules. The ±250 ms jitter
 window is too narrow at the larger waits.
 
 **Fix:** full-jitter backoff: `random(0, 500 * 2^attempt)`.
+
+**Status:** Applied to both retry sites (network-error branch and
+API-error branch including rate-limit handling) in `src/agent/client.ts`.
 
 ### RF-9 — Artifact eviction is age-only (S)
 
@@ -205,7 +208,7 @@ After each extraction, the diff against `app.tsx` should shrink and the
 new module should ship with its own tests. Track this as a quarter-long
 effort, not a single PR.
 
-### RF-15 — LSP `restartAttempts` is dead state (S)
+### RF-15 — LSP `restartAttempts` is dead state (S) — ✅ shipped in #422
 
 `src/lsp/manager.ts`. The field exists but is never incremented. There is
 no auto-restart for crashed language servers; the session just shows the
@@ -214,7 +217,13 @@ server as "crashed" and stops offering its tools.
 **Fix:** on `exit` with non-zero code, requeue start with exponential
 backoff up to N attempts (e.g., 3). Surface attempts in `/lsp status`.
 
-### RF-16 — MCP and LSP tool calls have no per-call timeout (M)
+**Status:** Auto-restart with full-jitter exponential backoff (default
+3 attempts, capped at 10s) landed in #422 as M3.3. `restartAttempts`
+is now populated and surfaced on `LspServerStatus`. The `/lsp status`
+slash-command surface itself remains to be built — deferred to avoid
+conflict with the M4 `app.tsx` extractions.
+
+### RF-16 — MCP and LSP tool calls have no per-call timeout (M) — ✅ shipped in #421 and #422
 
 `src/mcp/manager.ts`, `src/lsp/manager.ts`.
 
@@ -224,6 +233,13 @@ waiting on the tool call result until then.
 
 **Fix:** per-tool `timeoutMs` (default 30–60 s for MCP, 10 s for most LSP
 operations). Surface as a `ToolError` so the loop can recover the turn.
+
+**Status:** MCP per-call timeout (default 60s) landed in #421 as
+M3.1; LSP per-request timeout (default 10s) landed in #422 as M3.2.
+Both configurable per server via `timeoutMs`. The structured
+`ToolError` surface is still pending (M2.1) — for now timeouts
+surface as plain labeled `Error` messages flattened to
+`ToolResult.content`.
 
 ### RF-17 — Resume after reducer-config change can misread artifacts (M)
 
@@ -252,7 +268,7 @@ sanitization, this is a footgun.
 good escape helper) rather than template strings; add a unit test with
 adversarial inputs (`"`, `$`, `;`, backticks).
 
-### RF-19 — `isolated-vm` → `node:vm` fallback warning fires once per process (S)
+### RF-19 — `isolated-vm` → `node:vm` fallback warning fires once per process (S) — ✅ shipped (M1.10)
 
 `src/code-mode/sandbox.ts`, `fallbackWarningShown` flag.
 
@@ -263,6 +279,10 @@ they're outside a true sandbox.
 
 **Fix:** track per session, not per process. Re-emit on each session
 start that uses code mode.
+
+**Status:** Boolean flag replaced with a `Set<sessionId>` keyed off
+`ctx.sessionId`. New sessions in the same process now see the
+warning.
 
 ### RF-20 — Ctrl+C race between `useInput` and SIGINT handler leaves TUI half-dead (S)
 
