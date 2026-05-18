@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import type { LimitDecision, LoopDecision } from "./limit-modal.js";
 import type { CustomCommand } from "../commands/types.js";
+import type { ModelEntry } from "../models/registry.js";
 
 export interface LimitModalState {
   limit: number;
@@ -40,6 +41,14 @@ export interface ModalHostController {
   setShowLspWizard: (v: boolean) => void;
   showThemePicker: boolean;
   setShowThemePicker: (v: boolean) => void;
+  showModelPicker: boolean;
+  setShowModelPicker: (v: boolean) => void;
+  keyEntryFor: ModelEntry | null;
+  setKeyEntryFor: (v: ModelEntry | null) => void;
+  billingChooserFor: ModelEntry | null;
+  setBillingChooserFor: (v: ModelEntry | null) => void;
+  unifiedProbeFor: ModelEntry | null;
+  setUnifiedProbeFor: (v: ModelEntry | null) => void;
   showRemoteDashboard: boolean;
   setShowRemoteDashboard: (v: boolean) => void;
   showInboxModal: boolean;
@@ -79,6 +88,10 @@ export function useModalHost(): ModalHostController {
   const [showCommandList, setShowCommandList] = useState(false);
   const [showLspWizard, setShowLspWizard] = useState(false);
   const [showThemePicker, setShowThemePicker] = useState(false);
+  const [showModelPicker, setShowModelPicker] = useState(false);
+  const [keyEntryFor, setKeyEntryFor] = useState<ModelEntry | null>(null);
+  const [billingChooserFor, setBillingChooserFor] = useState<ModelEntry | null>(null);
+  const [unifiedProbeFor, setUnifiedProbeFor] = useState<ModelEntry | null>(null);
   const [showRemoteDashboard, setShowRemoteDashboard] = useState(false);
   const [showInboxModal, setShowInboxModal] = useState(false);
   const [showHooksDashboard, setShowHooksDashboard] = useState(false);
@@ -91,6 +104,10 @@ export function useModalHost(): ModalHostController {
       showCommandList ||
       showLspWizard ||
       showThemePicker ||
+      showModelPicker ||
+      keyEntryFor !== null ||
+      billingChooserFor !== null ||
+      unifiedProbeFor !== null ||
       showRemoteDashboard ||
       showInboxModal ||
       showHooksDashboard;
@@ -107,6 +124,10 @@ export function useModalHost(): ModalHostController {
     showCommandList,
     showLspWizard,
     showThemePicker,
+    showModelPicker,
+    keyEntryFor,
+    billingChooserFor,
+    unifiedProbeFor,
     showRemoteDashboard,
     showInboxModal,
     showHooksDashboard,
@@ -123,6 +144,10 @@ export function useModalHost(): ModalHostController {
     showCommandList, setShowCommandList,
     showLspWizard, setShowLspWizard,
     showThemePicker, setShowThemePicker,
+    showModelPicker, setShowModelPicker,
+    keyEntryFor, setKeyEntryFor,
+    billingChooserFor, setBillingChooserFor,
+    unifiedProbeFor, setUnifiedProbeFor,
     showRemoteDashboard, setShowRemoteDashboard,
     showInboxModal, setShowInboxModal,
     showHooksDashboard, setShowHooksDashboard,
@@ -141,6 +166,7 @@ export interface ModalFlagsInput {
   showCommandList: boolean;
   showLspWizard: boolean;
   showThemePicker: boolean;
+  showModelPicker: boolean;
   showRemoteDashboard: boolean;
   showInboxModal: boolean;
 }
@@ -159,6 +185,7 @@ export function computeModalFlags(s: ModalFlagsInput): ModalFlags {
     s.showCommandList ||
     s.showLspWizard ||
     s.showThemePicker ||
+    s.showModelPicker ||
     s.showRemoteDashboard ||
     s.showInboxModal;
   const hasOverlayModal = s.limitModal !== null || s.loopModal !== null;
@@ -178,6 +205,7 @@ export const EMPTY_MODAL_STATE: ModalFlagsInput = {
   showCommandList: false,
   showLspWizard: false,
   showThemePicker: false,
+  showModelPicker: false,
   showRemoteDashboard: false,
   showInboxModal: false,
 };

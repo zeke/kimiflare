@@ -19,6 +19,8 @@ interface Props {
   turnStartedAt: number | null;
   mode: Mode;
   contextLimit: number;
+  /** Active model id (shown in status bar). */
+  model?: string;
   gatewayMeta?: GatewayMeta | null;
   codeMode?: boolean;
   cloudMode?: boolean;
@@ -35,7 +37,7 @@ interface Props {
   intentTier?: IntentTier;
 }
 
-export function StatusBar({ usage, sessionUsage, thinking, turnStartedAt, mode, contextLimit, gatewayMeta, codeMode, cloudMode, cloudBudget, skillsActive, memoryRecalled, phase, currentTool, lastActivityAt, kimiMdStale, gitBranch, intentTier }: Props) {
+export function StatusBar({ usage, sessionUsage, thinking, turnStartedAt, mode, contextLimit, model, gatewayMeta, codeMode, cloudMode, cloudBudget, skillsActive, memoryRecalled, phase, currentTool, lastActivityAt, kimiMdStale, gitBranch, intentTier }: Props) {
   const theme = useTheme();
   const [now, setNow] = useState(Date.now());
   const modeColor =
@@ -52,6 +54,7 @@ export function StatusBar({ usage, sessionUsage, thinking, turnStartedAt, mode, 
 
   const idleParts: string[] = [];
   if (gitBranch) idleParts.push(gitBranch);
+  if (model) idleParts.push(shortenModelId(model));
   if (cloudMode) idleParts.push("CLOUD");
   if (codeMode) idleParts.push("CODE");
 
@@ -102,7 +105,7 @@ export function StatusBar({ usage, sessionUsage, thinking, turnStartedAt, mode, 
       {usage && (
         <Box>
           <Text color={theme.info.color} >
-            {buildRightParts(usage, contextLimit, sessionUsage, gatewayMeta, cloudMode, cloudBudget).join("  ·  ")}
+            {buildRightParts(usage, contextLimit, sessionUsage, gatewayMeta, cloudMode, cloudBudget, model).join("  ·  ")}
           </Text>
           {sessionUsage?.reconcilePending ? (
             <Text color={theme.muted?.color ?? theme.info.color} dimColor={theme.muted?.dim ?? true}>
@@ -140,6 +143,7 @@ export function buildRightParts(
   gatewayMeta?: GatewayMeta | null,
   cloudMode?: boolean,
   cloudBudget?: { remaining: number; limit: number } | null,
+  model?: string,
 ): string[] {
   const pct = Math.round((usage.prompt_tokens / contextLimit) * 100);
   const parts: string[] = [];
@@ -160,7 +164,10 @@ export function buildRightParts(
     }
   } else {
     const cached = usage.prompt_tokens_details?.cached_tokens ?? 0;
-    const cost = calculateCost(usage.prompt_tokens, usage.completion_tokens, cached);
+    // Pass the current model so pricing.ts uses that provider's rates instead
+    // of falling back to Kimi K2.6's hardcoded constants — otherwise an Opus
+    // turn (\$15 in / \$75 out per Mtok) shows up as if it cost Kimi rates.
+    const cost = calculateCost(usage.prompt_tokens, usage.completion_tokens, cached, model);
     parts.push(`in ${usage.prompt_tokens}${cached ? ` (${cached} cached)` : ""}`);
     parts.push(`ctx ${pct}%`);
     if (cloudMode) {
@@ -198,6 +205,19 @@ export function formatGatewayCacheStatus(gatewayMeta?: GatewayMeta | null): stri
 function formatDuration(ms: number): string {
   if (ms < 1000) return `${Math.round(ms)}ms`;
   return `${(ms / 1000).toFixed(1)}s`;
+}
+
+/** Shorten a model id for the status bar: drop the provider prefix and keep
+ *  the recognizable tail. "@cf/moonshotai/kimi-k2.6" → "kimi-k2.6",
+ *  "anthropic/claude-sonnet-4-6" → "claude-sonnet-4-6". */
+export function shortenModelId(id: string): string {
+  if (id.startsWith("@")) {
+    const parts = id.split("/");
+    return parts[parts.length - 1] ?? id;
+  }
+  const slash = id.indexOf("/");
+  if (slash === -1) return id;
+  return id.slice(slash + 1);
 }
 
 function formatElapsed(ms: number): string {

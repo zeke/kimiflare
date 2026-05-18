@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback } from "react";
+import React, { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { Box, Text, useApp, useInput, render } from "ink";
 
 import { runAgentTurn, AgentLoopError } from "./agent/loop.js";
@@ -86,6 +86,10 @@ import { ThemeProvider } from "./ui/theme-context.js";
 import { resolveTheme, themeList, themeNames, DEFAULT_THEME_NAME } from "./ui/theme.js";
 import { loadAndMergeThemes } from "./ui/theme-loader.js";
 import type { Theme } from "./ui/theme.js";
+import { getModelOrInfer, type ModelEntry } from "./models/registry.js";
+import { decideNextStep } from "./models/next-step.js";
+import type { KeyResult } from "./ui/key-entry-modal.js";
+import type { BillingChoice } from "./ui/billing-chooser.js";
 import type { ResolvedLspConfig } from "./util/lsp-config.js";
 import { maybeLspNudge } from "./util/lsp-nudge.js";
 import { glob } from "./util/glob.js";
@@ -171,6 +175,20 @@ export interface Cfg {
   cloudMode?: boolean;
   cloudToken?: string;
   shell?: string;
+  providerKeys?: {
+    anthropic?: string;
+    openai?: string;
+    google?: string;
+    "openai-compatible"?: string;
+  };
+  providerKeyAliases?: {
+    anthropic?: string;
+    openai?: string;
+    google?: string;
+    "openai-compatible"?: string;
+  };
+  secretsStoreId?: string;
+  unifiedBilling?: boolean;
 }
 function App({
   initialCfg,
@@ -189,6 +207,10 @@ function App({
 }) {
   const { exit } = useApp();
   const [cfg, setCfg] = useState<Cfg | null>(initialCfg);
+  const modelContextLimit = useMemo(
+    () => (cfg ? getModelOrInfer(cfg.model).contextWindow : CONTEXT_LIMIT),
+    [cfg?.model],
+  );
   const [lspScope, setLspScope] = useState<"project" | "global">(initialLspScope);
   const [lspProjectPath, setLspProjectPath] = useState<string | null>(initialLspProjectPath);
   const [cloudToken, setCloudToken] = useState(initialCloudToken);
@@ -268,6 +290,10 @@ function App({
     showCommandList, setShowCommandList,
     showLspWizard, setShowLspWizard,
     showThemePicker, setShowThemePicker,
+    setShowModelPicker,
+    keyEntryFor: _keyEntryFor, setKeyEntryFor,
+    setBillingChooserFor,
+    setUnifiedProbeFor,
     showRemoteDashboard, setShowRemoteDashboard,
     showInboxModal, setShowInboxModal,
     hasFullscreenModal,
@@ -1110,6 +1136,157 @@ function App({
     [],
   );
 
+  const handleModelPick = useCallback(
+    (picked: ModelEntry | null) => {
+      setShowModelPicker(false);
+      if (!picked) return;
+      // Persist the model selection first (cheap & expected even if onboarding is mid-flight).
+      setCfg((c) => {
+        if (!c) return c;
+        const updated = { ...c, model: picked.id };
+        void saveConfig(updated).catch(() => {});
+        return updated;
+      });
+      setEvents((e) => [
+        ...e,
+        {
+          kind: "info",
+          key: mkKey(),
+          text: `model: ${picked.id} · ${picked.contextWindow.toLocaleString()} ctx`,
+        },
+      ]);
+      // Route the rest of onboarding through the shared decision table.
+      const next = decideNextStep(cfg, picked);
+      if (next.kind === "ready") return;
+      if (next.kind === "needs-gateway") {
+        setEvents((e) => [
+          ...e,
+          {
+            kind: "info",
+            key: mkKey(),
+            text: `${picked.id} routes through Cloudflare AI Gateway, but no gateway is configured — run /gateway <id>`,
+          },
+        ]);
+        return;
+      }
+      if (next.kind === "billing-choice") {
+        setBillingChooserFor(picked);
+        return;
+      }
+      // needs-key
+      setKeyEntryFor(picked);
+    },
+    [cfg, mkKey, setShowModelPicker, setBillingChooserFor, setKeyEntryFor],
+  );
+
+  const handlePickBilling = useCallback(
+    (model: ModelEntry, choice: BillingChoice | null) => {
+      setBillingChooserFor(null);
+      if (!choice) {
+        setEvents((e) => [
+          ...e,
+          { kind: "info", key: mkKey(), text: "billing setup cancelled — pick again with /model" },
+        ]);
+        return;
+      }
+      if (choice === "byok") {
+        setKeyEntryFor(model);
+        return;
+      }
+      // choice === "unified" → kick off the probe
+      setUnifiedProbeFor(model);
+    },
+    [mkKey, setBillingChooserFor, setKeyEntryFor, setUnifiedProbeFor],
+  );
+
+  const handleUnifiedProbeResolve = useCallback(
+    (model: ModelEntry, r: "enabled" | "fallback-byok" | "cancelled") => {
+      setUnifiedProbeFor(null);
+      if (r === "enabled") {
+        setCfg((prev) => {
+          if (!prev) return prev;
+          const updated = { ...prev, unifiedBilling: true };
+          void saveConfig(updated).catch(() => {});
+          return updated;
+        });
+        setEvents((e) => [
+          ...e,
+          {
+            kind: "info",
+            key: mkKey(),
+            text: `✓ ${model.id} ready — billed via your Cloudflare credits.`,
+          },
+        ]);
+        return;
+      }
+      if (r === "fallback-byok") {
+        setKeyEntryFor(model);
+        return;
+      }
+      // cancelled
+      setEvents((e) => [
+        ...e,
+        { kind: "info", key: mkKey(), text: "unified billing setup cancelled" },
+      ]);
+    },
+    [mkKey, setUnifiedProbeFor, setKeyEntryFor],
+  );
+
+  const handleSaveProviderKey = useCallback(
+    (model: ModelEntry, result: KeyResult) => {
+      setKeyEntryFor(null);
+      const provider = model.provider as "anthropic" | "openai" | "google" | "openai-compatible";
+      setCfg((prev) => {
+        if (!prev) return prev;
+        const updated = { ...prev };
+        if (result.kind === "alias") {
+          updated.providerKeyAliases = {
+            ...(prev.providerKeyAliases ?? {}),
+            [provider]: result.alias,
+          };
+          updated.secretsStoreId = result.secretsStoreId;
+          // If we previously stored a local key for this provider, drop it — the
+          // alias supersedes it and we don't want the secret hanging around.
+          if (prev.providerKeys?.[provider]) {
+            const { [provider]: _drop, ...rest } = prev.providerKeys;
+            updated.providerKeys = rest;
+          }
+        } else {
+          updated.providerKeys = {
+            ...(prev.providerKeys ?? {}),
+            [provider]: result.key,
+          };
+        }
+        void saveConfig(updated).catch(() => {});
+        return updated;
+      });
+      setEvents((e) => [
+        ...e,
+        {
+          kind: "info",
+          key: mkKey(),
+          text:
+            result.kind === "alias"
+              ? `✓ ${provider} key stored in Cloudflare Secrets Store — ${model.id} is ready to use.`
+              : `⚠ ${provider} key saved locally at ~/.config/kimiflare/config.json. Do not commit this file.`,
+        },
+      ]);
+    },
+    [mkKey, setKeyEntryFor],
+  );
+
+  const handleCancelKeyEntry = useCallback(() => {
+    setKeyEntryFor(null);
+    setEvents((e) => [
+      ...e,
+      {
+        kind: "info",
+        key: mkKey(),
+        text: "key entry cancelled — run /model to pick again, or set up your key later.",
+      },
+    ]);
+  }, [mkKey, setKeyEntryFor]);
+
   const buildSlashContext = useCallback((): SlashContext => ({
     exit,
     busy,
@@ -1126,6 +1303,10 @@ function App({
     setHasUpdate,
     setLatestVersion,
     setShowThemePicker,
+    setShowModelPicker,
+    setKeyEntryFor,
+    setBillingChooserFor,
+    setUnifiedProbeFor,
     setShowInboxModal,
     setShowHooksDashboard: modals.setShowHooksDashboard,
     setShowLspWizard,
@@ -1172,7 +1353,8 @@ function App({
   }), [
     exit, busy, cfg, mode, lspScope, lspProjectPath,
     setCfg, setMode, setEvents, setUsage, setSessionUsage, setGatewayMeta,
-    setHasUpdate, setLatestVersion, setShowThemePicker, setShowInboxModal,
+    setHasUpdate, setLatestVersion, setShowThemePicker, setShowModelPicker, setKeyEntryFor,
+    setBillingChooserFor, setUnifiedProbeFor, setShowInboxModal,
     setShowLspWizard, setShowRemoteDashboard, setShowCommandList,
     setCommandWizard, setCommandPicker,
     turn.setShowReasoning,
@@ -1500,7 +1682,7 @@ function App({
         },
         onUsageFinal: (u: Usage, meta?: GatewayMeta) => {
           const sid = ensureSessionId();
-          void recordUsage(sid, u, gatewayUsageLookupFromConfig(cfg, meta ?? gatewayMetaRef.current));
+          void recordUsage(sid, u, gatewayUsageLookupFromConfig(cfg, meta ?? gatewayMetaRef.current), cfg?.model);
           void getCostReport(sid).then((report) => setSessionUsage(report.session));
           // Refresh cloud budget so remaining tokens update in real time
           if (cfg?.cloudMode && (cloudToken ?? initialCloudToken)) {
@@ -1639,6 +1821,9 @@ function App({
           cloudMode: cfg.cloudMode,
           cloudToken: cloudToken ?? initialCloudToken,
           cloudDeviceId: cloudDeviceId ?? initialCloudDeviceId,
+          providerKeys: cfg.providerKeys,
+          providerKeyAliases: cfg.providerKeyAliases,
+          unifiedBilling: cfg.unifiedBilling,
           onIterationEnd,
           intentClassification: classification,
           sessionStartRecall: sessionStartRecallRef.current ?? undefined,
@@ -1651,7 +1836,7 @@ function App({
             cloudMode: cfg.cloudMode,
             cloudToken: cloudToken ?? initialCloudToken,
             cloudDeviceId: cloudDeviceId ?? initialCloudDeviceId,
-            maxSkillTokens: CONTEXT_LIMIT - 10_000,
+            maxSkillTokens: modelContextLimit - 10_000,
           },
           mode: modeRef.current,
           cacheStable: cacheStableRef.current,
@@ -1898,18 +2083,18 @@ function App({
 
   useEffect(() => {
     if (compactSuggestedRef.current) return;
-    if (usage && usage.prompt_tokens / CONTEXT_LIMIT >= AUTO_COMPACT_SUGGEST_PCT) {
+    if (usage && usage.prompt_tokens / modelContextLimit >= AUTO_COMPACT_SUGGEST_PCT) {
       compactSuggestedRef.current = true;
       setEvents((e) => [
         ...e,
         {
           kind: "info",
           key: mkKey(),
-          text: `context ${Math.round((usage.prompt_tokens / CONTEXT_LIMIT) * 100)}% full — run /compact to summarize older turns`,
+          text: `context ${Math.round((usage.prompt_tokens / modelContextLimit) * 100)}% full — run /compact to summarize older turns`,
         },
       ]);
     }
-  }, [usage]);
+  }, [usage, modelContextLimit]);
 
   if (!cfg) {
     return (
@@ -1967,6 +2152,16 @@ function App({
         onLspSave={handleLspSave}
         themes={themeList()}
         onPickTheme={handleThemePick}
+        currentModel={cfg?.model ?? ""}
+        onPickModel={handleModelPick}
+        onSaveProviderKey={handleSaveProviderKey}
+        onCancelKeyEntry={handleCancelKeyEntry}
+        onPickBilling={handlePickBilling}
+        onUnifiedProbeResolve={handleUnifiedProbeResolve}
+        accountId={cfg?.accountId ?? ""}
+        apiToken={cfg?.apiToken ?? ""}
+        secretsStoreId={cfg?.secretsStoreId}
+        aiGatewayId={cfg?.aiGatewayId}
         selectedRemoteSession={selectedRemoteSession}
         onSelectRemoteSession={setSelectedRemoteSession}
         onCancelRemoteSession={handleRemoteCancel}
@@ -2035,7 +2230,8 @@ function App({
               thinking={busy}
               turnStartedAt={turnStartedAt}
               mode={mode}
-              contextLimit={CONTEXT_LIMIT}
+              contextLimit={modelContextLimit}
+              model={cfg.model}
               gatewayMeta={gatewayMeta}
               codeMode={codeMode}
               cloudMode={cfg.cloudMode}

@@ -17,6 +17,7 @@ import { selectSkills } from "../skills/router.js";
 import type { SemanticSkillRoutingResult } from "../skills/types.js";
 import type Database from "better-sqlite3";
 import { buildSystemPrompt, buildSessionPrefix } from "./system-prompt.js";
+import { getModelOrInfer } from "../models/registry.js";
 import type { Mode } from "../mode.js";
 
 export interface AgentCallbacks {
@@ -105,6 +106,12 @@ export interface AgentTurnOpts {
   cloudMode?: boolean;
   cloudToken?: string;
   cloudDeviceId?: string;
+  /** Per-provider API keys (BYOK) forwarded to AI Gateway. */
+  providerKeys?: Partial<Record<"workers-ai" | "anthropic" | "openai" | "google" | "openai-compatible", string>>;
+  /** Per-provider alias names referencing CF Secrets Store entries (fire-and-forget BYOK). */
+  providerKeyAliases?: Partial<Record<"workers-ai" | "anthropic" | "openai" | "google" | "openai-compatible", string>>;
+  /** Whether to use Cloudflare Unified Billing for models that support it. */
+  unifiedBilling?: boolean;
   /** Shell override for the bash tool. If omitted, the tool auto-detects based on platform. */
   shell?: string;
   /** Session-start memory recall promise. If provided, awaited at turn start and injected into messages. */
@@ -211,9 +218,9 @@ function isHighSignalMemory(memory: {
   );
 }
 
-/** Hard ceiling for prompt tokens before we refuse to call the API.
- *  Leaves ~22k tokens of headroom below the 262,144 context window. */
-const MAX_PROMPT_TOKENS = 240_000;
+/** Fraction of the model's context window we'll let the prompt occupy before
+ *  refusing the call. Leaves headroom for the response. */
+const PROMPT_TOKEN_SOFT_LIMIT_RATIO = 0.92;
 
 /** Max characters for a single tool result message before truncation.
  *  ~10k chars ≈ 2,500 tokens — generous but prevents runaway growth. */
@@ -552,9 +559,11 @@ export async function runAgentTurn(opts: AgentTurnOpts): Promise<void> {
     }
 
     const promptTokens = estimatePromptTokens(apiMessages);
-    if (promptTokens > MAX_PROMPT_TOKENS) {
+    const ctxWindow = getModelOrInfer(opts.model).contextWindow;
+    const maxPromptTokens = Math.floor(ctxWindow * PROMPT_TOKEN_SOFT_LIMIT_RATIO);
+    if (promptTokens > maxPromptTokens) {
       throw new Error(
-        `kimiflare: context window exceeded (~${promptTokens.toLocaleString()} tokens). ` +
+        `kimiflare: context window exceeded (~${promptTokens.toLocaleString()} / ${ctxWindow.toLocaleString()} tokens). ` +
           `Run /compact to summarize older turns, or /clear to start fresh.`,
       );
     }
@@ -592,6 +601,9 @@ export async function runAgentTurn(opts: AgentTurnOpts): Promise<void> {
       cloudMode: opts.cloudMode,
       cloudToken: opts.cloudToken,
       cloudDeviceId: opts.cloudDeviceId,
+      providerKeys: opts.providerKeys,
+      providerKeyAliases: opts.providerKeyAliases,
+      unifiedBilling: opts.unifiedBilling,
       idleTimeoutMs: opts.idleTimeoutMs ?? 60_000,
       postFirstByteIdleTimeoutMs: opts.postFirstByteIdleTimeoutMs,
     });

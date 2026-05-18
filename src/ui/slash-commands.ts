@@ -27,6 +27,9 @@ import {
   getSessionGatewayLogs,
 } from "../usage-tracker.js";
 import { resolveTheme, themeNames, DEFAULT_THEME_NAME } from "./theme.js";
+import { listModels, getModelOrInfer, type ModelEntry } from "../models/registry.js";
+import { decideNextStep } from "../models/next-step.js";
+import { validateModelId } from "../agent/client.js";
 import { getShellCommand } from "../tools/bash.js";
 import {
   createSkill,
@@ -102,6 +105,10 @@ export interface SlashContext {
 
   // Modal setters
   setShowThemePicker: (v: boolean) => void;
+  setShowModelPicker: (v: boolean) => void;
+  setKeyEntryFor: (v: ModelEntry | null) => void;
+  setBillingChooserFor: (v: ModelEntry | null) => void;
+  setUnifiedProbeFor: (v: ModelEntry | null) => void;
   setShowInboxModal: (v: boolean) => void;
   setShowLspWizard: (v: boolean) => void;
   setShowRemoteDashboard: (v: boolean) => void;
@@ -306,11 +313,199 @@ const handleShell: Handler = (ctx, _rest, arg) => {
   return true;
 };
 
-const handleModel: Handler = (ctx) => {
-  ctx.setEvents((e) => [
+const handleModel: Handler = (ctx, rest, arg) => {
+  const { cfg, setCfg, setEvents, mkKey } = ctx;
+  const sub = rest[0]?.toLowerCase() ?? "";
+
+  // `/model` with no args → open the picker
+  if (!arg) {
+    ctx.setShowModelPicker(true);
+    return true;
+  }
+
+  // `/model list` → textual list grouped by provider
+  if (sub === "list") {
+    const all = listModels();
+    const byProvider = new Map<string, ModelEntry[]>();
+    for (const m of all) {
+      const arr = byProvider.get(m.provider) ?? [];
+      arr.push(m);
+      byProvider.set(m.provider, arr);
+    }
+    const lines: string[] = [`available models (current: ${cfg?.model ?? "unknown"}):`];
+    for (const [provider, list] of byProvider) {
+      lines.push(`  ${provider}:`);
+      for (const m of list) {
+        const marker = m.id === cfg?.model ? "●" : " ";
+        const ctxStr = m.contextWindow >= 1_000_000
+          ? `${(m.contextWindow / 1_000_000).toFixed(1)}M`
+          : `${Math.round(m.contextWindow / 1_000)}k`;
+        const price = m.pricing.inputPerMtok === 0 && m.pricing.outputPerMtok === 0
+          ? "price n/a"
+          : `$${m.pricing.inputPerMtok}/$${m.pricing.outputPerMtok}`;
+        lines.push(`    ${marker} ${m.id}  (${ctxStr} ctx, ${price}, ${m.billingMode})`);
+      }
+    }
+    setEvents((e) => [...e, { kind: "info", key: mkKey(), text: lines.join("\n") }]);
+    return true;
+  }
+
+  // `/model <id>` → set directly, then route through the same decision table
+  // as the picker (Workers-AI → ready; Unified-eligible → chooser; BYOK-only → key entry).
+  try {
+    validateModelId(arg);
+  } catch {
+    setEvents((e) => [
+      ...e,
+      { kind: "info", key: mkKey(), text: `invalid model id: ${arg}` },
+    ]);
+    return true;
+  }
+  const entry = getModelOrInfer(arg);
+  setCfg((prev) => {
+    if (!prev) return prev;
+    const updated = { ...prev, model: arg };
+    void saveConfig(updated).catch(() => {});
+    return updated;
+  });
+  setEvents((e) => [
     ...e,
-    { kind: "info", key: ctx.mkKey(), text: `current model: ${ctx.cfg?.model ?? "unknown"}` },
+    {
+      kind: "info",
+      key: mkKey(),
+      text: `model: ${arg} · ${entry.contextWindow.toLocaleString()} ctx`,
+    },
   ]);
+
+  const next = decideNextStep(cfg, entry);
+  if (next.kind === "needs-gateway") {
+    setEvents((e) => [
+      ...e,
+      { kind: "info", key: mkKey(), text: `⚠ no AI Gateway configured — run /gateway <id>` },
+    ]);
+  } else if (next.kind === "billing-choice") {
+    ctx.setBillingChooserFor(entry);
+  } else if (next.kind === "needs-key") {
+    ctx.setKeyEntryFor(entry);
+  }
+  return true;
+};
+
+type ProviderKeyName = "anthropic" | "openai" | "google" | "openai-compatible";
+const PROVIDER_KEY_NAMES: ProviderKeyName[] = ["anthropic", "openai", "google", "openai-compatible"];
+
+function maskKey(k: string): string {
+  if (k.length <= 8) return "***";
+  return `${k.slice(0, 4)}…${k.slice(-4)}`;
+}
+
+const handleKeys: Handler = (ctx, rest) => {
+  const { cfg, setCfg, setEvents, mkKey } = ctx;
+  if (!cfg) {
+    setEvents((e) => [...e, { kind: "info", key: mkKey(), text: "no config loaded" }]);
+    return true;
+  }
+
+  const sub = rest[0]?.toLowerCase() ?? "list";
+
+  if (sub === "list" || sub === "status") {
+    const lines: string[] = ["provider keys:"];
+    for (const name of PROVIDER_KEY_NAMES) {
+      const v = cfg.providerKeys?.[name];
+      lines.push(`  ${name}: ${v ? maskKey(v) : "(not set)"}`);
+    }
+    lines.push(`unifiedBilling: ${cfg.unifiedBilling ? "on" : "off"}`);
+    lines.push("");
+    lines.push("usage:");
+    lines.push("  /keys set <provider> <key>     set or replace a provider key");
+    lines.push("  /keys clear <provider>         remove a provider key");
+    lines.push("  /keys unified on|off           toggle Cloudflare Unified Billing");
+    setEvents((e) => [...e, { kind: "info", key: mkKey(), text: lines.join("\n") }]);
+    return true;
+  }
+
+  if (sub === "unified") {
+    const val = rest[1]?.toLowerCase();
+    if (val !== "on" && val !== "off") {
+      setEvents((e) => [...e, { kind: "info", key: mkKey(), text: "usage: /keys unified on|off" }]);
+      return true;
+    }
+    const on = val === "on";
+    setCfg((prev) => {
+      if (!prev) return prev;
+      const updated = { ...prev, unifiedBilling: on };
+      void saveConfig(updated).catch(() => {});
+      return updated;
+    });
+    setEvents((e) => [
+      ...e,
+      {
+        kind: "info",
+        key: mkKey(),
+        text: on
+          ? "unifiedBilling: on — make sure Unified Billing is enabled for this gateway in the Cloudflare dashboard"
+          : "unifiedBilling: off",
+      },
+    ]);
+    return true;
+  }
+
+  if (sub === "set") {
+    const provider = rest[1]?.toLowerCase() as ProviderKeyName | undefined;
+    const value = rest.slice(2).join(" ").trim();
+    if (!provider || !PROVIDER_KEY_NAMES.includes(provider) || !value) {
+      setEvents((e) => [
+        ...e,
+        {
+          kind: "info",
+          key: mkKey(),
+          text: `usage: /keys set <${PROVIDER_KEY_NAMES.join("|")}> <key>`,
+        },
+      ]);
+      return true;
+    }
+    setCfg((prev) => {
+      if (!prev) return prev;
+      const updated = {
+        ...prev,
+        providerKeys: { ...(prev.providerKeys ?? {}), [provider]: value },
+      };
+      void saveConfig(updated).catch(() => {});
+      return updated;
+    });
+    setEvents((e) => [
+      ...e,
+      { kind: "info", key: mkKey(), text: `${provider} key: ${maskKey(value)} (saved)` },
+    ]);
+    return true;
+  }
+
+  if (sub === "clear") {
+    const provider = rest[1]?.toLowerCase() as ProviderKeyName | undefined;
+    if (!provider || !PROVIDER_KEY_NAMES.includes(provider)) {
+      setEvents((e) => [
+        ...e,
+        {
+          kind: "info",
+          key: mkKey(),
+          text: `usage: /keys clear <${PROVIDER_KEY_NAMES.join("|")}>`,
+        },
+      ]);
+      return true;
+    }
+    setCfg((prev) => {
+      if (!prev?.providerKeys) return prev;
+      const next = { ...prev.providerKeys };
+      delete next[provider];
+      const updated = { ...prev, providerKeys: next };
+      void saveConfig(updated).catch(() => {});
+      return updated;
+    });
+    setEvents((e) => [...e, { kind: "info", key: mkKey(), text: `${provider} key cleared` }]);
+    return true;
+  }
+
+  setEvents((e) => [...e, { kind: "info", key: mkKey(), text: "unknown subcommand — try /keys list" }]);
   return true;
 };
 
@@ -1353,6 +1548,7 @@ const handlers: Record<string, Handler> = {
   "/cost": handleCost,
   "/shell": handleShell,
   "/model": handleModel,
+  "/keys": handleKeys,
   "/gateway": handleGateway,
   "/mode": handleMode,
   "/theme": handleTheme,
