@@ -280,11 +280,17 @@ function App({
     showLspWizard, setShowLspWizard,
     showThemePicker, setShowThemePicker,
     setShowModelPicker,
+    showModePicker, setShowModePicker,
     keyEntryFor: _keyEntryFor, setKeyEntryFor,
     setBillingChooserFor,
     setUnifiedProbeFor,
     showRemoteDashboard, setShowRemoteDashboard,
     showInboxModal, setShowInboxModal,
+    showHelpMenu, setShowHelpMenu,
+    showMemoryPicker, setShowMemoryPicker,
+    showGatewayPicker, setShowGatewayPicker,
+    showSkillsPicker, setShowSkillsPicker,
+    showShellPicker, setShowShellPicker,
     hasFullscreenModal,
     hasAnyModal,
   } = modals;
@@ -488,7 +494,13 @@ function App({
     perm !== null ||
     limitModal !== null ||
     loopModal !== null ||
-    showInboxModal;
+    showInboxModal ||
+    showHelpMenu ||
+    showModePicker ||
+    showMemoryPicker ||
+    showGatewayPicker ||
+    showSkillsPicker ||
+    showShellPicker;
 
   const loadFilePickerItems = useCallback(async (): Promise<FilePickerItem[]> => {
     const cwd = process.cwd();
@@ -1255,16 +1267,22 @@ function App({
     setLatestVersion,
     setShowThemePicker,
     setShowModelPicker,
+    setShowModePicker,
     setKeyEntryFor,
     setBillingChooserFor,
     setUnifiedProbeFor,
     setShowInboxModal,
     setShowHooksDashboard: modals.setShowHooksDashboard,
+    setShowHelpMenu,
     setShowLspWizard,
     setShowRemoteDashboard,
     setShowCommandList,
     setCommandWizard,
     setCommandPicker,
+    setShowMemoryPicker,
+    setShowGatewayPicker,
+    setShowSkillsPicker,
+    setShowShellPicker,
     lspScope,
     lspProjectPath,
     resetSession,
@@ -1304,8 +1322,9 @@ function App({
   }), [
     exit, busy, cfg, mode, lspScope, lspProjectPath,
     setCfg, setMode, setEvents, setUsage, setSessionUsage, setGatewayMeta,
-    setHasUpdate, setLatestVersion, setShowThemePicker, setShowModelPicker, setKeyEntryFor,
-    setBillingChooserFor, setUnifiedProbeFor, setShowInboxModal,
+    setHasUpdate, setLatestVersion, setShowThemePicker, setShowModelPicker, setShowModePicker, setKeyEntryFor,
+    setBillingChooserFor, setUnifiedProbeFor, setShowInboxModal, setShowHelpMenu,
+    setShowMemoryPicker, setShowGatewayPicker, setShowSkillsPicker, setShowShellPicker,
     setShowLspWizard, setShowRemoteDashboard, setShowCommandList,
     setCommandWizard, setCommandPicker,
     turn.setShowReasoning,
@@ -2048,6 +2067,14 @@ function App({
         onPickTheme={handleThemePick}
         currentModel={cfg?.model ?? ""}
         onPickModel={handleModelPick}
+        currentMode={mode}
+        onPickMode={(m) => {
+          if (m) {
+            setMode(m);
+            setEvents((e) => [...e, { kind: "info", key: mkKey(), text: `mode: ${m}` }]);
+          }
+          setShowModePicker(false);
+        }}
         onSaveProviderKey={handleSaveProviderKey}
         onCancelKeyEntry={handleCancelKeyEntry}
         onPickBilling={handlePickBilling}
@@ -2071,6 +2098,75 @@ function App({
         }}
         cwd={process.cwd()}
         onHooksMutate={() => hooksManagerRef.current.reload()}
+        costAttributionEnabled={cfg?.costAttribution ?? false}
+        onRunCommand={(cmd) => {
+          // Defer so the modal closes before the command runs
+          setTimeout(() => handleSlash(cmd), 0);
+        }}
+        currentShell={cfg?.shell}
+        onPickShell={(shell) => {
+          if (shell) {
+            const next = { ...cfg!, shell: shell === "auto" ? undefined : shell };
+            setCfg(next);
+            void saveConfig(next).catch(() => {});
+            setEvents((e) => [...e, { kind: "info", key: mkKey(), text: `shell set to ${shell}` }]);
+          }
+          setShowShellPicker(false);
+        }}
+        memoryEnabled={memoryManagerRef.current !== null}
+        memoryManager={memoryManagerRef.current}
+        onMemoryAction={(action) => {
+          setShowMemoryPicker(false);
+          setTimeout(() => handleSlash(`/memory ${action}`), 0);
+        }}
+        onMemoryDone={() => setShowMemoryPicker(false)}
+        gatewayId={cfg?.aiGatewayId}
+        gatewaySkipCache={cfg?.aiGatewaySkipCache}
+        gatewayCollectLogs={cfg?.aiGatewayCollectLogPayload}
+        gatewayMetadataCount={Object.keys(cfg?.aiGatewayMetadata ?? {}).length}
+        onGatewayAction={(action) => {
+          setShowGatewayPicker(false);
+          if (action === "set_id") {
+            setEvents((e) => [...e, { kind: "info", key: mkKey(), text: "Type /gateway <id> to set the gateway ID." }]);
+            return;
+          }
+          if (action === "set_ttl") {
+            setEvents((e) => [...e, { kind: "info", key: mkKey(), text: "Type /gateway cache-ttl <seconds> to set the cache TTL." }]);
+            return;
+          }
+          if (action === "add_meta") {
+            setEvents((e) => [...e, { kind: "info", key: mkKey(), text: "Type /gateway metadata KEY=VALUE to add metadata." }]);
+            return;
+          }
+          if (action === "toggle_skip") {
+            const next = !cfg?.aiGatewaySkipCache;
+            setTimeout(() => handleSlash(`/gateway skip-cache ${next}`), 0);
+            return;
+          }
+          if (action === "toggle_logs") {
+            const next = !cfg?.aiGatewayCollectLogPayload;
+            setTimeout(() => handleSlash(`/gateway collect-logs ${next}`), 0);
+            return;
+          }
+          if (action === "clear_meta") {
+            setTimeout(() => handleSlash("/gateway metadata clear"), 0);
+            return;
+          }
+          if (action === "off") {
+            setTimeout(() => handleSlash("/gateway off"), 0);
+            return;
+          }
+        }}
+        onGatewayDone={() => setShowGatewayPicker(false)}
+        onSkillsAction={(action) => {
+          setShowSkillsPicker(false);
+          if (action === "list") {
+            setTimeout(() => handleSlash("/skills list"), 0);
+            return;
+          }
+          setEvents((e) => [...e, { kind: "info", key: mkKey(), text: `Type /skills ${action} <name> to ${action} a skill.` }]);
+        }}
+        onSkillsDone={() => setShowSkillsPicker(false)}
       />
     );
   }
