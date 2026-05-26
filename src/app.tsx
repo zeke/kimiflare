@@ -171,6 +171,8 @@ export interface Cfg {
   githubTokenExpiry?: number;
   githubRepo?: string;
   shell?: string;
+  /** Preferred interactive UI engine. Persisted via the `/ui` slash command. */
+  uiEngine?: "ink" | "camouflage";
   providerKeys?: {
     anthropic?: string;
     openai?: string;
@@ -279,6 +281,7 @@ function App({
     showCommandList, setShowCommandList,
     showLspWizard, setShowLspWizard,
     showThemePicker, setShowThemePicker,
+    showUiPicker, setShowUiPicker,
     setShowModelPicker,
     showModePicker, setShowModePicker,
     keyEntryFor: _keyEntryFor, setKeyEntryFor,
@@ -1101,6 +1104,32 @@ function App({
     [],
   );
 
+  const handleUiPick = useCallback(
+    (picked: "ink" | "camouflage" | null) => {
+      setShowUiPicker(false);
+      if (!picked) return;
+      setCfg((c) => {
+        if (!c) return c;
+        const updated = { ...c, uiEngine: picked };
+        void saveConfig(updated).catch(() => {});
+        return updated;
+      });
+      setEvents((e) => [
+        ...e,
+        {
+          kind: "error",
+          key: mkKey(),
+          text:
+            `UI engine set to "${picked}". RESTART kimiflare for it to take effect.` +
+            (picked === "camouflage"
+              ? " (Camouflage is EXPERIMENTAL — `kimiflare --ui ink` or `unset KIMIFLARE_UI` to bail.)"
+              : ""),
+        },
+      ]);
+    },
+    [mkKey, setShowUiPicker],
+  );
+
   const handleModelPick = useCallback(
     (picked: ModelEntry | null) => {
       setShowModelPicker(false);
@@ -1268,6 +1297,7 @@ function App({
     setHasUpdate,
     setLatestVersion,
     setShowThemePicker,
+    setShowUiPicker,
     setShowModelPicker,
     setShowModePicker,
     setKeyEntryFor,
@@ -2119,6 +2149,8 @@ function App({
         onLspSave={handleLspSave}
         themes={themeList()}
         onPickTheme={handleThemePick}
+        currentUiEngine={cfg?.uiEngine ?? "ink"}
+        onPickUi={handleUiPick}
         currentModel={cfg?.model ?? ""}
         onPickModel={handleModelPick}
         currentMode={mode}
