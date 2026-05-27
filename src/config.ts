@@ -116,6 +116,16 @@ export interface KimiConfig {
   };
   /** Id of the Cloudflare Secrets Store kimi-code uses for provider-key BYOK aliases. */
   secretsStoreId?: string;
+  /** Worker endpoint URL for spawning standalone research/executor workers. */
+  workerEndpoint?: string;
+  /** Max cost per worker in USD (default: 1.0). */
+  workerBudgetUsd?: number;
+  /** Max workers to spawn in parallel (default: 3). */
+  workerMaxParallel?: number;
+  /** Timeout per worker in milliseconds (default: 300000 = 5 min). */
+  workerTimeoutMs?: number;
+  /** Enable multi-agent-experimental mode in the mode cycle. Default: false. */
+  multiAgentEnabled?: boolean;
 }
 
 export const DEFAULT_MODEL = "@cf/moonshotai/kimi-k2.6";
@@ -293,6 +303,11 @@ export async function loadConfig(): Promise<KimiConfig | null> {
       providerKeyAliases: persisted?.providerKeyAliases,
       secretsStoreId: persisted?.secretsStoreId,
       unifiedBilling: envUnifiedBilling ?? persisted?.unifiedBilling,
+      workerEndpoint: process.env.KIMIFLARE_WORKER_ENDPOINT,
+      workerBudgetUsd: readNumberEnv("KIMIFLARE_WORKER_BUDGET_USD"),
+      workerMaxParallel: readNumberEnv("KIMIFLARE_WORKER_MAX_PARALLEL"),
+      workerTimeoutMs: readNumberEnv("KIMIFLARE_WORKER_TIMEOUT_MS"),
+      multiAgentEnabled: readBooleanEnv("KIMIFLARE_MULTI_AGENT_ENABLED"),
     };
   }
 
@@ -335,6 +350,11 @@ export async function loadConfig(): Promise<KimiConfig | null> {
         providerKeyAliases: parsed.providerKeyAliases,
         secretsStoreId: parsed.secretsStoreId,
         unifiedBilling: envUnifiedBilling ?? parsed.unifiedBilling,
+        workerEndpoint: parsed.workerEndpoint,
+        workerBudgetUsd: parsed.workerBudgetUsd,
+        workerMaxParallel: parsed.workerMaxParallel,
+        workerTimeoutMs: parsed.workerTimeoutMs,
+        multiAgentEnabled: parsed.multiAgentEnabled,
       };
     }
   }

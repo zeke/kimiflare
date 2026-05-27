@@ -36,6 +36,7 @@ import type { LimitDecision, LoopDecision } from "./ui/limit-modal.js";
 import { ResumePicker } from "./ui/resume-picker.js";
 import { CheckpointPicker } from "./ui/checkpoint-picker.js";
 import { TaskList } from "./ui/task-list.js";
+import { WorkerList } from "./ui/worker-list.js";
 import type { Task } from "./tools/registry.js";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
@@ -187,6 +188,7 @@ export interface Cfg {
   };
   secretsStoreId?: string;
   unifiedBilling?: boolean;
+  multiAgentEnabled?: boolean;
 }
 function App({
   initialCfg,
@@ -320,6 +322,8 @@ function App({
   const [kimiMdStale, setKimiMdStale] = useState(false);
   const [gitBranch, setGitBranch] = useState<string | null>(null);
   const [lastSessionTopic, setLastSessionTopic] = useState<string | null>(null);
+  const [activeWorkers, setActiveWorkers] = useState<import("./agent/supervisor.js").ActiveWorker[]>([]);
+  const [isSynthesizing, setIsSynthesizing] = useState(false);
 
   useEffect(() => {
     setGitBranch(detectGitBranch());
@@ -900,7 +904,13 @@ function App({
       return;
     }
     if (key.shift && key.tab) {
-      setMode((m) => nextMode(m));
+      setMode((m) => {
+        const next = nextMode(m);
+        if (next === "multi-agent-experimental" && !cfg?.multiAgentEnabled) {
+          return nextMode(next);
+        }
+        return next;
+      });
       return;
     }
     if (key.ctrl && inputChar === "o") {
@@ -1614,6 +1624,59 @@ function App({
       const effectiveCodeMode = classification.tier === "heavy";
       setCodeMode(effectiveCodeMode);
 
+      // Two-gate check for multi-agent mode:
+      // 1. Mode gate: multi-agent-experimental must be active
+      // 2. Tier gate: task must be classified as "heavy"
+      if (modeRef.current === "multi-agent-experimental") {
+        if (classification.tier !== "heavy") {
+          setEvents((e) => [
+            ...e,
+            { kind: "info", key: mkKey(), text: `multi-agent mode active, but task is ${classification.tier} — running locally` },
+          ]);
+        } else {
+          setEvents((e) => [
+            ...e,
+            { kind: "info", key: mkKey(), text: "multi-agent mode: spawning parallel research workers..." },
+          ]);
+          try {
+            setIsSynthesizing(true);
+            const { plan, conflicts, recommendations } = await supervisorRef.current!.autoSpawnWorkers(
+              trimmed,
+              `Current project: ${process.cwd()}`,
+              (workers) => setActiveWorkers(workers),
+            );
+            setIsSynthesizing(false);
+            setEvents((e) => [
+              ...e,
+              { kind: "info", key: mkKey(), text: "workers completed — synthesizing findings" },
+            ]);
+            messagesRef.current.push({ role: "system", content: plan });
+            if (conflicts.length > 0) {
+              setEvents((e) => [
+                ...e,
+                { kind: "info", key: mkKey(), text: `conflicts detected:\n${conflicts.join("\n")}` },
+              ]);
+            }
+            setEvents((e) => [
+              ...e,
+              { kind: "info", key: mkKey(), text: `synthesized ${recommendations.length} recommendation(s)` },
+            ]);
+            await saveSessionSafe();
+            endTurn();
+            return;
+          } catch (e) {
+            setIsSynthesizing(false);
+            const err = e as Error;
+            setEvents((e) => [
+              ...e,
+              { kind: "error", key: mkKey(), text: `multi-agent spawn failed: ${err.message}` },
+            ]);
+            endTurn();
+            return;
+          }
+        }
+      }
+
       const turnScope = sessionScopeRef.current.createChild();
       activeScopeRef.current = turnScope;
 
@@ -1771,6 +1834,9 @@ function App({
               memoryRecalled: info.memoryRecalled,
             },
           ]);
+        },
+        onWorkersUpdated: (workers: import("./agent/supervisor.js").ActiveWorker[]) => {
+          setActiveWorkers(workers);
         },
       };
 
@@ -2154,6 +2220,7 @@ function App({
         currentModel={cfg?.model ?? ""}
         onPickModel={handleModelPick}
         currentMode={mode}
+        multiAgentEnabled={cfg?.multiAgentEnabled}
         onPickMode={(m) => {
           if (m) {
             setMode(m);
@@ -2284,6 +2351,9 @@ function App({
           />
         ) : (
           <Box flexDirection="column" marginTop={1}>
+            {activeWorkers.length > 0 && (
+              <WorkerList workers={activeWorkers} isSynthesizing={isSynthesizing} />
+            )}
             {tasks.length > 0 && (
               <TaskList
                 tasks={tasks}
