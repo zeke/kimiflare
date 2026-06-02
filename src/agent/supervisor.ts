@@ -11,6 +11,8 @@ import { runAgentTurn } from "./loop.js";
 import type { AgentTurnOpts } from "./loop.js";
 import { logger } from "../util/logger.js";
 import type { WorkerResultMessage } from "./messages.js";
+import { detectRepoInfo, type RepoInfo } from "../util/repo-info.js";
+import { loadConfig } from "../config.js";
 
 export type TurnPhase = "idle" | "preparing" | "streaming" | "executing" | "compacting" | "error";
 
@@ -41,6 +43,12 @@ export interface ActiveWorker {
   startedAt: number;
   result?: WorkerResultMessage;
   error?: string;
+  /** Raw stdout from the remote agent (available once the worker finishes). */
+  rawOutput?: string;
+  /** Worker reasoning summary (available once the worker finishes). */
+  reasoning?: string;
+  /** Coordinator-side log of what happened during this worker's lifecycle. */
+  logs: string[];
 }
 
 export class TurnSupervisor {
@@ -125,16 +133,48 @@ export class TurnSupervisor {
     workers: SpawnWorkerOpts[],
     onUpdate?: (workers: ActiveWorker[]) => void,
   ): Promise<WorkerResultMessage[]> {
-    const endpoint = process.env.KIMIFLARE_WORKER_ENDPOINT;
+    // Read config first; env vars override individual fields for back-compat.
+    // We also fall back to the /remote setup endpoint when the dedicated
+    // multi-agent fields aren't set — same Commute worker hosts both, so most
+    // users who already ran /remote setup get /multi-agent for free.
+    const cfg = await loadConfig().catch(() => null);
+    const endpoint =
+      process.env.KIMIFLARE_WORKER_ENDPOINT
+      ?? cfg?.workerEndpoint
+      ?? cfg?.remoteWorkerUrl;
     if (!endpoint) {
-      throw new Error("Worker endpoint not configured. Set KIMIFLARE_WORKER_ENDPOINT.");
+      throw new Error(
+        "Multi-agent endpoint not configured. Open /multi-agent and pick Set up to deploy one.",
+      );
     }
 
-    const apiKey = process.env.KIMIFLARE_WORKER_API_KEY;
+    const apiKey =
+      process.env.KIMIFLARE_WORKER_API_KEY
+      ?? cfg?.workerApiKey
+      ?? cfg?.remoteAuthSecret;
+    // KIMIFLARE_CLI_REF stays as a dev/CI env override only — there's no
+    // config field or UI for it. End users always get the latest published
+    // kimiflare via the server's `npm install -g kimiflare@latest` step.
+    const cliRef = process.env.KIMIFLARE_CLI_REF;
     const maxParallel = Math.min(
       workers.length,
       parseInt(process.env.KIMIFLARE_WORKER_MAX_PARALLEL ?? "3", 10),
     );
+
+    // Sandbox-driven workers need a repo to clone — detect once.
+    const repoInfo = detectRepoInfo();
+    if ("error" in repoInfo) {
+      throw new Error(`cannot spawn workers: ${repoInfo.error}`);
+    }
+    const repo: RepoInfo = repoInfo;
+
+    if (!cfg?.accountId || !cfg?.apiToken) {
+      throw new Error(
+        "Cloudflare credentials not found in your config — re-run /init or set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN.",
+      );
+    }
+    const userAccountId = cfg.accountId;
+    const userApiToken = cfg.apiToken;
 
     // Register all workers as pending
     for (const w of workers) {
@@ -145,24 +185,31 @@ export class TurnSupervisor {
         task: w.task,
         status: "pending",
         startedAt: Date.now(),
+        logs: [],
       });
     }
     onUpdate?.(this.activeWorkers);
 
     const results: WorkerResultMessage[] = [];
     const queue = [...workers];
+    // Capture the instance Map so the inner runBatch (a regular function with
+    // its own `this`) can reach it. Earlier this used `TurnSupervisor.prototype._activeWorkers`,
+    // which is undefined because _activeWorkers is an instance field, not on
+    // the prototype — that caused "Cannot read properties of undefined (reading 'entries')".
+    const activeWorkers = this._activeWorkers;
 
     async function runBatch(batch: SpawnWorkerOpts[]): Promise<void> {
       await Promise.all(
         batch.map(async (w) => {
-          const workerId = [...TurnSupervisor.prototype._activeWorkers.entries()].find(
+          const workerId = [...activeWorkers.entries()].find(
             ([, aw]) => aw.task === w.task && aw.status === "pending",
           )?.[0];
           if (!workerId) return;
 
-          const worker = TurnSupervisor.prototype._activeWorkers.get(workerId)!;
+          const worker = activeWorkers.get(workerId)!;
           worker.status = "running";
-          onUpdate?.([...TurnSupervisor.prototype._activeWorkers.values()]);
+          worker.logs.push(`[coordinator] Starting worker → POST ${endpoint}/worker`);
+          onUpdate?.([...activeWorkers.values()]);
 
           try {
             const payload = {
@@ -173,48 +220,172 @@ export class TurnSupervisor {
               outputFormat: "structured" as const,
               tools: w.mode === "plan" ? ("read-only" as const) : ("all" as const),
               model: w.model ?? "@cf/moonshotai/kimi-k2.6",
+              // Sandbox-driven worker needs the repo to clone:
+              githubToken: repo.token,
+              owner: repo.owner,
+              repo: repo.repo,
+              baseBranch: w.baseBranch ?? repo.baseBranch,
+              // Reuse the USER's Cloudflare creds (already configured) so
+              // worker LLM calls bill against their account, not the
+              // Commute operator's. Server falls back to operator creds if
+              // these are absent (older client + new server).
+              userAccountId,
+              userApiToken,
+              // Optionally override the in-sandbox kimiflare install so the
+              // worker runs pre-release / branch code instead of the image-
+              // baked version. e.g. `kimiflare@latest`, `kimiflare@1.2.3`,
+              // `github:sinameraji/kimiflare#feat/foo`.
+              ...(cliRef ? { kimiflareInstall: cliRef } : {}),
               ...(w.mode === "execute"
                 ? {
                     branchName: w.branchName,
-                    baseBranch: w.baseBranch ?? "main",
                     prTitle: w.prTitle,
                     prBody: w.prBody,
                   }
                 : {}),
             };
 
-            const controller = new AbortController();
-            const timeoutMs = parseInt(process.env.KIMIFLARE_WORKER_TIMEOUT_MS ?? "300000", 10);
-            const timer = setTimeout(() => controller.abort(), timeoutMs);
+            const timeoutMs = parseInt(process.env.KIMIFLARE_WORKER_TIMEOUT_MS ?? "600000", 10);
 
-            const res = await fetch(`${endpoint}/worker`, {
+            worker.logs.push(`[coordinator] Sending payload (${JSON.stringify(payload).length} bytes)`);
+            worker.logs.push(`[coordinator] Worker will clone ${repo.owner}/${repo.repo} and run kimiflare inside Cloudflare Sandbox`);
+            worker.logs.push(`[coordinator] Typical runtime: 1–4 min. Timeout: ${Math.round(timeoutMs / 1000)}s`);
+            onUpdate?.([...activeWorkers.values()]);
+
+            // ── Start the worker via DO (returns immediately with workerId) ──
+            const startRes = await fetch(`${endpoint}/worker`, {
               method: "POST",
               headers: {
                 "Content-Type": "application/json",
                 ...(apiKey ? { "X-Worker-Api-Key": apiKey } : {}),
               },
               body: JSON.stringify(payload),
-              signal: controller.signal,
             });
-            clearTimeout(timer);
+            if (!startRes.ok) {
+              const text = await startRes.text().catch(() => "");
+              throw new Error(`Worker start failed: ${startRes.status} ${text.slice(0, 200)}`);
+            }
+            const { workerId: remoteWorkerId } = (await startRes.json()) as { workerId: string };
+            worker.logs.push(`[coordinator] Worker started (id: ${remoteWorkerId}) — polling for progress…`);
+            onUpdate?.([...activeWorkers.values()]);
 
-            if (!res.ok) {
-              const text = await res.text().catch(() => "");
-              throw new Error(`Worker endpoint returned ${res.status}: ${text.slice(0, 200)}`);
+            // ── Poll progress every 3s until done or timeout ──
+            const pollInterval = 3000;
+            const startTime = Date.now();
+            let lastLogCount = 0;
+            let data: WorkerResultMessage | undefined;
+
+            while (Date.now() - startTime < timeoutMs) {
+              await new Promise((r) => setTimeout(r, pollInterval));
+
+              let progressRes: Response | undefined;
+              let lastPollErr: string | undefined;
+              for (let attempt = 1; attempt <= 3; attempt++) {
+                try {
+                  progressRes = await fetch(`${endpoint}/worker/${remoteWorkerId}/progress`, {
+                    headers: apiKey ? { "X-Worker-Api-Key": apiKey } : {},
+                  });
+                  break;
+                } catch (err) {
+                  lastPollErr = err instanceof Error ? err.message : String(err);
+                  if (attempt < 3) {
+                    await new Promise((r) => setTimeout(r, pollInterval * attempt));
+                  }
+                }
+              }
+              if (!progressRes) {
+                worker.logs.push(`[coordinator] Progress poll failed (3 retries): ${lastPollErr}`);
+                onUpdate?.([...activeWorkers.values()]);
+                continue;
+              }
+              if (!progressRes.ok) {
+                worker.logs.push(`[coordinator] Progress poll HTTP error: ${progressRes.status}`);
+                onUpdate?.([...activeWorkers.values()]);
+                continue;
+              }
+
+              const progress = (await progressRes.json()) as {
+                status: "pending" | "running" | "completed" | "failed";
+                step: string;
+                stepIndex: number;
+                totalSteps: number;
+                message: string;
+                logs: string[];
+                completedSteps: string[];
+                error?: string;
+                result?: WorkerResultMessage;
+              };
+
+              // Append new logs (only the ones we haven't seen)
+              const newLogs = progress.logs.slice(lastLogCount);
+              lastLogCount = progress.logs.length;
+              for (const logLine of newLogs) {
+                worker.logs.push(`[worker] ${logLine}`);
+              }
+
+              // Show current step
+              worker.logs.push(`[coordinator] Step ${progress.stepIndex}/${progress.totalSteps}: ${progress.message}`);
+              onUpdate?.([...activeWorkers.values()]);
+
+              if (progress.status === "completed" || progress.status === "failed") {
+                if (progress.result) {
+                  data = progress.result;
+                } else if (progress.error) {
+                  data = {
+                    workerId: remoteWorkerId,
+                    status: "failed",
+                    task: w.task,
+                    findings: [],
+                    recommendations: [],
+                    filesRead: [],
+                    webSources: [],
+                    costUsd: 0,
+                    tokensUsed: 0,
+                    reasoning: "",
+                    error: progress.error,
+                  } as WorkerResultMessage;
+                }
+                break;
+              }
             }
 
-            const data = (await res.json()) as WorkerResultMessage;
+            if (!data) {
+              throw new Error(`Worker timed out after ${Math.round(timeoutMs / 1000)}s`);
+            }
+
             worker.status = data.status === "completed" ? "completed" : "failed";
             worker.result = data;
+            worker.rawOutput = data.rawOutput;
+            worker.reasoning = data.reasoning;
+            worker.logs.push(`[coordinator] Worker finished with status: ${data.status}`);
+            if (data.phases && data.phases.length > 0) {
+              const timeline = data.phases.map((p) => `${p.name}: ${Math.round(p.ms / 1000)}s`).join(" · ");
+              worker.logs.push(`[coordinator] Phase timing: ${timeline}`);
+            }
+            if (data.error) {
+              worker.logs.push(`[coordinator] Worker error: ${data.error}`);
+            }
+            if (data.rawOutput) {
+              worker.logs.push(`[coordinator] Worker raw output (${data.rawOutput.length} chars):`);
+              worker.logs.push(...data.rawOutput.split("\n").slice(-30));
+            }
             if (data.status === "completed") {
               results.push(data);
             }
           } catch (e) {
             worker.status = "failed";
-            worker.error = (e as Error).message;
-            logger.error("spawnWorkers:failed", { workerId, error: (e as Error).message });
+            const err = e as Error;
+            const cause = (err as unknown as { cause?: Error }).cause;
+            let diagnostic = cause ? `${err.message} (${cause.message})` : err.message;
+            // Surface common sandbox/DO failure modes in the UI
+            if (diagnostic.includes("Network connection lost") || diagnostic.includes("reset")) {
+              diagnostic += " — Cloudflare Sandbox Durable Object reset. This can happen when the worker exceeds CPU/memory limits or hits a transient platform issue. Try reducing task complexity or retrying.";
+            }
+            worker.error = diagnostic;
+            worker.logs.push(`[coordinator] Fetch failed: ${diagnostic}`);
+            logger.error("spawnWorkers:failed", { workerId, error: diagnostic });
           }
-          onUpdate?.([...TurnSupervisor.prototype._activeWorkers.values()]);
+          onUpdate?.([...activeWorkers.values()]);
         }),
       );
     }
@@ -328,10 +499,59 @@ export class TurnSupervisor {
     prompt: string,
     context: string,
     onUpdate?: (workers: ActiveWorker[]) => void,
-  ): Promise<{ plan: string; conflicts: string[]; recommendations: string[] }> {
+    onPhaseChange?: (phase: "spawning" | "synthesizing" | "complete") => void,
+  ): Promise<{
+    plan: string;
+    conflicts: string[];
+    recommendations: string[];
+    prUrl?: string;
+    executor?: { status: "completed" | "failed"; error?: string };
+  }> {
     const workers = decomposePrompt(prompt, context);
-    const results = await this.spawnWorkers(workers, onUpdate);
-    return this.synthesizeFindings(results);
+    onPhaseChange?.("spawning");
+    try {
+      const results = await this.spawnWorkers(workers, onUpdate);
+      onPhaseChange?.("synthesizing");
+      const synth = this.synthesizeFindings(results);
+
+      // Auto plan→execute chain ("the 4th agent"). Off by default for safety;
+      // opt in via /multi-agent in the TUI or KIMIFLARE_AUTO_EXECUTE=1. Only
+      // fires when synthesis produced actionable recommendations.
+      const cfg = await loadConfig().catch(() => null);
+      const autoExecute =
+        cfg?.autoExecute ?? /^(1|true|yes|on)$/i.test(process.env.KIMIFLARE_AUTO_EXECUTE ?? "");
+      if (!autoExecute || synth.recommendations.length === 0) {
+        return synth;
+      }
+
+      const executeTask = [
+        `Original request: ${prompt}`,
+        "",
+        "A research pass produced this plan. Implement it.",
+        "",
+        synth.plan,
+      ].join("\n");
+
+      try {
+        const execResults = await this.spawnWorkers(
+          [{ mode: "execute", task: executeTask, context }],
+          onUpdate,
+        );
+        const exec = execResults[0];
+        if (!exec) {
+          return { ...synth, executor: { status: "failed", error: "executor worker did not return a result" } };
+        }
+        return {
+          ...synth,
+          prUrl: exec.prUrl,
+          executor: { status: exec.status === "completed" ? "completed" : "failed", error: exec.error },
+        };
+      } catch (err) {
+        return { ...synth, executor: { status: "failed", error: err instanceof Error ? err.message : String(err) } };
+      }
+    } finally {
+      onPhaseChange?.("complete");
+    }
   }
 
   clearWorkers(): void {
@@ -339,42 +559,37 @@ export class TurnSupervisor {
   }
 }
 
-/** Simple heuristic to decompose a heavy prompt into parallel research tasks.
+/** Conservative heuristic to decompose a heavy prompt into parallel research tasks.
  *
- * Looks for:
- * - Lists: "research X, Y, and Z" → 3 workers
- * - Conjunctions: "research X and Y" → 2 workers
- * - Fallback: 2 workers with different angles (overview + deep-dive)
+ * Only splits the prompt when the user gave EXPLICIT list structure — numbered
+ * (`1. … 2. … 3. …`) or bulleted (`- …`/`* …`) — because that's the only
+ * cheap signal that's reliably a list. Earlier this also split on any
+ * conjunction or comma, which chopped cohesive sentences like "do heavy
+ * exploration AND research IN this project AND identify…" into nonsense
+ * fragments.
+ *
+ * For prose prompts (no explicit list), spawn 2 workers with the FULL prompt
+ * preserved and different angles. The synthesizer dedups overlapping findings,
+ * so two well-formed angles beat N fragmented ones.
  */
 export function decomposePrompt(prompt: string, context: string): SpawnWorkerOpts[] {
-  // Try to find comma-separated or "and"-separated research topics
-  const listMatch = prompt.match(/research\s+(.+?)(?:\s+and\s+|,\s+)(.+)/i);
-  if (listMatch) {
-    const parts = prompt
-      .replace(/research\s+/i, "")
-      .split(/\s+and\s+|,\s+/)
-      .map((s) => s.trim())
-      .filter((s) => s.length > 0);
-    if (parts.length >= 2) {
-      return parts.slice(0, 4).map((task) => ({
-        mode: "plan" as const,
-        task: `Research ${task}`,
-        context,
-      }));
-    }
+  const items = extractListItems(prompt);
+  if (items.length >= 2) {
+    return items.slice(0, 4).map((task) => ({ mode: "plan" as const, task, context }));
   }
-
-  // Fallback: 2 workers with different angles
   return [
-    {
-      mode: "plan",
-      task: `Research overview and best practices for: ${prompt}`,
-      context,
-    },
-    {
-      mode: "plan",
-      task: `Research implementation details and migration path for: ${prompt}`,
-      context,
-    },
+    { mode: "plan", task: `Research overview and best practices for: ${prompt}`, context },
+    { mode: "plan", task: `Investigate implementation details, trade-offs, and risks for: ${prompt}`, context },
   ];
+}
+
+/** Pull explicit list items from a prompt: numbered (`1. …`, `1) …`) or
+ *  bulleted (`- …`, `* …`, `• …`). Returns trimmed item bodies, or [] when
+ *  no clear list structure is present. */
+function extractListItems(prompt: string): string[] {
+  const numbered = [...prompt.matchAll(/(?:^|\n)\s*\d+[.)]\s+([^\n]+)/g)].map((m) => m[1]?.trim() ?? "");
+  if (numbered.length >= 2) return numbered.filter((s) => s.length > 0);
+  const bulleted = [...prompt.matchAll(/(?:^|\n)\s*[-*•]\s+([^\n]+)/g)].map((m) => m[1]?.trim() ?? "");
+  if (bulleted.length >= 2) return bulleted.filter((s) => s.length > 0);
+  return [];
 }
