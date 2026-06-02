@@ -133,6 +133,12 @@ export interface KimiConfig {
   /** When true, after plan workers synthesize, spawn one executor worker
    *  to implement the synthesized plan and open a PR. Off by default. */
   autoExecute?: boolean;
+  /** Forward memory context to multi-agent workers. Default: true. */
+  workerProxyMemory?: boolean;
+  /** Forward LSP context to multi-agent workers. Default: false. */
+  workerProxyLsp?: boolean;
+  /** Forward MCP context to multi-agent workers. Default: false. */
+  workerProxyMcp?: boolean;
   /** Model used for LLM-based task decomposition in multi-agent mode.
    *  Default: @cf/moonshotai/kimi-k2.5 (fast and cheap). */
   decompositionModel?: string;
