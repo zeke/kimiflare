@@ -1,7 +1,10 @@
 import { describe, it, afterEach, beforeEach } from "node:test";
 import assert from "node:assert";
-import { TurnSupervisor, decomposePrompt } from "./supervisor.js";
+import { TurnSupervisor, decomposePrompt, preReadFilesForWorkers, getPreReadFilesFromMemory } from "./supervisor.js";
 import type { WorkerResultMessage, WorkerFinding } from "./messages.js";
+import { mkdtemp, writeFile, rm, mkdir } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 function result(
   workerId: string,
@@ -444,5 +447,129 @@ describe("getFileTreeSnapshot", () => {
     const tree = await getFileTreeSnapshot(process.cwd());
     assert.ok(typeof tree === "string");
     assert.ok(tree.length > 0);
+  });
+});
+
+describe("preReadFilesForWorkers", () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), "kf-test-"));
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("reads files and formats them with separators", async () => {
+    await writeFile(join(tmpDir, "a.txt"), "hello", "utf8");
+    await writeFile(join(tmpDir, "b.txt"), "world", "utf8");
+    const out = await preReadFilesForWorkers(["a.txt", "b.txt"], tmpDir, 10_000);
+    assert.strictEqual(out.filesRead.length, 2);
+    assert.ok(out.text.includes("--- a.txt ---"));
+    assert.ok(out.text.includes("hello"));
+    assert.ok(out.text.includes("--- b.txt ---"));
+    assert.ok(out.text.includes("world"));
+    assert.strictEqual(out.chars, 10); // "hello" + "world" = 10 chars
+  });
+
+  it("respects maxChars and truncates", async () => {
+    await writeFile(join(tmpDir, "long.txt"), "a".repeat(100), "utf8");
+    const out = await preReadFilesForWorkers(["long.txt"], tmpDir, 50);
+    assert.strictEqual(out.filesRead.length, 1);
+    assert.ok(out.text.includes("a".repeat(50)));
+    assert.ok(out.text.includes("… (truncated)"));
+    assert.strictEqual(out.chars, 50 + "\n… (truncated)".length);
+  });
+
+  it("skips missing files gracefully", async () => {
+    await writeFile(join(tmpDir, "exists.txt"), "yes", "utf8");
+    const out = await preReadFilesForWorkers(["missing.txt", "exists.txt"], tmpDir, 10_000);
+    assert.strictEqual(out.filesRead.length, 1);
+    assert.ok(out.text.includes("exists.txt"));
+    assert.ok(!out.text.includes("missing.txt"));
+  });
+
+  it("returns empty result when no files are readable", async () => {
+    const out = await preReadFilesForWorkers(["nope.txt"], tmpDir, 10_000);
+    assert.strictEqual(out.filesRead.length, 0);
+    assert.strictEqual(out.text, "");
+    assert.strictEqual(out.chars, 0);
+  });
+
+  it("stops reading once maxChars is reached", async () => {
+    await writeFile(join(tmpDir, "first.txt"), "abc", "utf8");
+    await writeFile(join(tmpDir, "second.txt"), "def", "utf8");
+    const out = await preReadFilesForWorkers(["first.txt", "second.txt"], tmpDir, 2);
+    assert.strictEqual(out.filesRead.length, 1);
+    assert.ok(out.text.includes("first.txt"));
+    assert.ok(!out.text.includes("second.txt"));
+  });
+});
+
+describe("getPreReadFilesFromMemory", () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), "kf-mem-test-"));
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("returns empty array when memory is disabled", () => {
+    const files = getPreReadFilesFromMemory({ memoryEnabled: false }, tmpDir);
+    assert.deepStrictEqual(files, []);
+  });
+
+  it("returns empty array when memory DB does not exist", () => {
+    const files = getPreReadFilesFromMemory({ memoryEnabled: true }, tmpDir);
+    assert.deepStrictEqual(files, []);
+  });
+
+  it("derives top files from memory relatedFiles", async () => {
+    const dbPath = join(tmpDir, ".kimiflare", "memory.db");
+    await mkdir(join(tmpDir, ".kimiflare"), { recursive: true });
+
+    // Use dynamic import to avoid top-level better-sqlite3 dependency in tests
+    const { openMemoryDb, insertMemory } = await import("../memory/db.js");
+    const { fetchEmbeddings } = await import("../memory/embeddings.js");
+    const db = openMemoryDb(dbPath);
+
+    // Create a dummy embedding
+    const embedding = new Float32Array(768);
+    embedding.fill(0);
+
+    await insertMemory(db, {
+      content: "Entry point info",
+      category: "fact",
+      sourceSessionId: "s1",
+      repoPath: tmpDir,
+      importance: 3,
+      relatedFiles: ["src/index.tsx"],
+    }, embedding);
+
+    await insertMemory(db, {
+      content: "Package info",
+      category: "fact",
+      sourceSessionId: "s1",
+      repoPath: tmpDir,
+      importance: 4,
+      relatedFiles: ["package.json", "src/index.tsx"],
+    }, embedding);
+
+    await insertMemory(db, {
+      content: "Other info",
+      category: "fact",
+      sourceSessionId: "s1",
+      repoPath: tmpDir,
+      importance: 2,
+      relatedFiles: ["README.md"],
+    }, embedding);
+
+    const files = getPreReadFilesFromMemory({ memoryEnabled: true }, tmpDir, 10);
+    // Scores: src/index.tsx = 3+4=7, package.json = 4, README.md = 2
+    assert.deepStrictEqual(files, ["src/index.tsx", "package.json", "README.md"]);
   });
 });
