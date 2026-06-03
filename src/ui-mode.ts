@@ -84,7 +84,7 @@ import { summarizeMessagesViaLlm } from "./agent/llm-summarize.js";
 import { distillSessionPlan } from "./agent/distill.js";
 import { buildWelcome } from "./ui/greetings.js";
 import { themeList, resolveTheme } from "./ui/theme.js";
-import { checkForUpdate } from "./util/update-check.js";
+import { checkForUpdate, checkOptionalDependency } from "./util/update-check.js";
 import { writeToClipboard } from "./util/clipboard.js";
 import { calculateCost } from "./pricing.js";
 import { loadConfig, saveConfig, configPath, DEFAULT_MODEL } from "./config.js";
@@ -261,6 +261,18 @@ export async function runUiMode(opts: UiModeOpts): Promise<void> {
       }
     } catch {
       /* offline / DNS / 503 — silent, retried next startup */
+    }
+    try {
+      const dep = await checkOptionalDependency("camouflage-tui", "beta");
+      if (dep.hasUpdate && dep.latestVersion) {
+        cam.send("ShowToast", {
+          text: `camouflage-tui update available: ${dep.localVersion} → ${dep.latestVersion}  ·  run npm update camouflage-tui`,
+          kind: "info",
+          ttl_ms: 6000,
+        });
+      }
+    } catch {
+      /* optional dep check is best-effort */
     }
   })();
 
@@ -1876,19 +1888,39 @@ export async function runUiMode(opts: UiModeOpts): Promise<void> {
         return true;
       }
       case "update": {
-        cam.send("ShowToast", { text: "checking for updates…", kind: "info", ttl_ms: 1500 });
-        try {
-          const r = await checkForUpdate(true);
-          if (r.hasUpdate && r.latestVersion) {
-            cam.send("ShowToast", {
-              text: `update available: ${r.localVersion} → ${r.latestVersion}. Run: npm i -g kimiflare@latest`,
-              kind: "success", ttl_ms: 5000,
-            });
-          } else {
-            cam.send("ShowToast", { text: `up to date (${r.localVersion ?? "unknown"})`, kind: "info", ttl_ms: 2500 });
+        const updateArg = (rest[0] ?? "").toLowerCase();
+        if (updateArg === "camouflage") {
+          cam.send("ShowToast", { text: "checking camouflage-tui for updates…", kind: "info", ttl_ms: 1500 });
+          try {
+            const dep = await checkOptionalDependency("camouflage-tui", "beta");
+            if (dep.hasUpdate && dep.latestVersion) {
+              cam.send("ShowToast", {
+                text: `camouflage-tui update available: ${dep.localVersion} → ${dep.latestVersion}. Run: npm update camouflage-tui`,
+                kind: "success", ttl_ms: 5000,
+              });
+            } else if (dep.localVersion) {
+              cam.send("ShowToast", { text: `camouflage-tui up to date (${dep.localVersion})`, kind: "info", ttl_ms: 2500 });
+            } else {
+              cam.send("ShowToast", { text: "camouflage-tui is not installed", kind: "info", ttl_ms: 2500 });
+            }
+          } catch (err) {
+            cam.send("ShowToast", { text: `camouflage-tui update check failed: ${err instanceof Error ? err.message : String(err)}`, kind: "error", ttl_ms: 3000 });
           }
-        } catch (err) {
-          cam.send("ShowToast", { text: `update check failed: ${err instanceof Error ? err.message : String(err)}`, kind: "error", ttl_ms: 3000 });
+        } else {
+          cam.send("ShowToast", { text: "checking for updates…", kind: "info", ttl_ms: 1500 });
+          try {
+            const r = await checkForUpdate(true);
+            if (r.hasUpdate && r.latestVersion) {
+              cam.send("ShowToast", {
+                text: `update available: ${r.localVersion} → ${r.latestVersion}. Run: npm i -g kimiflare@latest`,
+                kind: "success", ttl_ms: 5000,
+              });
+            } else {
+              cam.send("ShowToast", { text: `up to date (${r.localVersion ?? "unknown"})`, kind: "info", ttl_ms: 2500 });
+            }
+          } catch (err) {
+            cam.send("ShowToast", { text: `update check failed: ${err instanceof Error ? err.message : String(err)}`, kind: "error", ttl_ms: 3000 });
+          }
         }
         return true;
       }
