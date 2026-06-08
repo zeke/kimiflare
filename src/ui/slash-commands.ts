@@ -215,27 +215,7 @@ const handleClear: Handler = (ctx) => {
   return true;
 };
 
-const handleFresh: Handler = (ctx) => {
-  const { busy, mkKey, setEvents } = ctx;
-  if (busy) {
-    setEvents((e) => [
-      ...e,
-      { kind: "info", key: mkKey(), text: "can't /fresh while model is running — press Esc to interrupt first" },
-    ]);
-    return true;
-  }
-
-  const plan = distillSessionPlan(ctx.messagesRef.current);
-  if (!plan) {
-    setEvents((e) => [
-      ...e,
-      { kind: "error", key: mkKey(), text: "No plan found to start fresh with." },
-    ]);
-    return true;
-  }
-
-  const clipResult = writeToClipboard(plan);
-
+export function executeFreshStart(ctx: SlashContext, planText: string): { success: boolean } {
   // Capture old session ID before reset so we can carry its cost forward
   const oldSessionId = ctx.sessionIdRef.current;
 
@@ -256,7 +236,7 @@ const handleFresh: Handler = (ctx) => {
   ctx.pendingToolCallsRef.current.clear();
   ctx.usageRef.current = null;
   ctx.turnCounterRef.current = 0;
-  setEvents([]);
+  ctx.setEvents([]);
   ctx.setUsage(null);
   ctx.setSessionUsage(null);
   ctx.gatewayMetaRef.current = null;
@@ -266,7 +246,7 @@ const handleFresh: Handler = (ctx) => {
   ctx.updateNudgedRef.current = false;
 
   // Seed with plan
-  ctx.messagesRef.current.push({ role: "user", content: plan });
+  ctx.messagesRef.current.push({ role: "user", content: planText });
 
   // Force creation of the new session ID and carry over the old cost baseline
   const newSessionId = ctx.ensureSessionId() as string;
@@ -275,6 +255,30 @@ const handleFresh: Handler = (ctx) => {
       void getCostReport(newSessionId).then((report) => ctx.setSessionUsage(report.session));
     });
   }
+
+  return writeToClipboard(planText);
+}
+
+const handleFresh: Handler = (ctx) => {
+  const { busy, mkKey, setEvents } = ctx;
+  if (busy) {
+    setEvents((e) => [
+      ...e,
+      { kind: "info", key: mkKey(), text: "can't /fresh while model is running — press Esc to interrupt first" },
+    ]);
+    return true;
+  }
+
+  const plan = distillSessionPlan(ctx.messagesRef.current);
+  if (!plan) {
+    setEvents((e) => [
+      ...e,
+      { kind: "error", key: mkKey(), text: "No plan found to start fresh with." },
+    ]);
+    return true;
+  }
+
+  const clipResult = executeFreshStart(ctx, plan);
 
   setEvents((e) => [
     ...e,
