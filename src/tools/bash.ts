@@ -3,6 +3,7 @@ import { tmpdir, platform } from "node:os";
 import { join } from "node:path";
 import type { ToolSpec, ToolContext, ToolOutput } from "./registry.js";
 import { logger } from "../util/logger.js";
+import { getUserAgent } from "../util/version.js";
 
 interface Args {
   command: string;
@@ -100,6 +101,214 @@ function formatBashTitle(raw: string): string {
   return `$ ${cmd}`.slice(0, 120);
 }
 
+/**
+ * Detect `git push` commands that would land on the repository's default branch
+ * and block them unless direct pushes are explicitly allowed. Returns a blocked
+ * ToolOutput when the push should not proceed; returns undefined otherwise.
+ */
+export async function guardGitPush(command: string, ctx: ToolContext): Promise<ToolOutput | undefined> {
+  const trimmed = command.trim();
+  if (!/\bgit\s+push\b/.test(trimmed)) return undefined;
+
+  const allowed = ctx.allowDirectPush === true || process.env.KIMIFLARE_ALLOW_DIRECT_PUSH === "1";
+  if (allowed) return undefined;
+
+  const defaultBranch = await getDefaultBranch(ctx.cwd);
+  if (!defaultBranch) return undefined; // not a git repo or no origin/HEAD
+
+  const target = parsePushTarget(trimmed);
+  if (!target) return undefined; // could not determine target — let git itself fail/succeed
+
+  // --all / --mirror are treated conservatively: they may push the default branch.
+  if (target.kind === "all" || target.kind === "mirror") {
+    const hint = await getBranchProtectionHint(ctx.cwd, defaultBranch, ctx);
+    const msg =
+      `Blocked: \`${trimmed}\` may push the default branch (${defaultBranch}). ` +
+      `Create a feature branch, push it, and open a PR with \`github_create_pr\`. ` +
+      `To allow direct pushes, set \`allowDirectPush: true\` in config or run with \`KIMIFLARE_ALLOW_DIRECT_PUSH=1\`.` +
+      (hint ? `\n${hint}` : "");
+    return makeErrorOutput(msg);
+  }
+
+  const targetBranch = target.kind === "current" ? await getCurrentBranch(ctx.cwd) : target.ref;
+  if (!targetBranch) return undefined;
+
+  if (targetBranch === defaultBranch) {
+    const hint = await getBranchProtectionHint(ctx.cwd, defaultBranch, ctx);
+    const msg =
+      `Blocked: \`${trimmed}\` would push directly to the default branch (${defaultBranch}). ` +
+      `Create a feature branch, push it, and open a PR with \`github_create_pr\`. ` +
+      `To allow direct pushes, set \`allowDirectPush: true\` in config or run with \`KIMIFLARE_ALLOW_DIRECT_PUSH=1\`.` +
+      (hint ? `\n${hint}` : "");
+    return makeErrorOutput(msg);
+  }
+
+  return undefined;
+}
+
+function makeErrorOutput(message: string): ToolOutput {
+  const bytes = Buffer.byteLength(message, "utf8");
+  return { content: message, rawBytes: bytes, reducedBytes: bytes };
+}
+
+async function execOnce(command: string, cwd: string): Promise<string | undefined> {
+  return new Promise((resolve) => {
+    const child = spawn("bash", ["-lc", command], { cwd });
+    let out = "";
+    child.stdout.on("data", (d: Buffer) => {
+      out += d.toString("utf8");
+    });
+    child.on("close", (code) => {
+      if (code !== 0) return resolve(undefined);
+      resolve(out.trim() || undefined);
+    });
+  });
+}
+
+async function getDefaultBranch(cwd: string): Promise<string | undefined> {
+  const raw = await execOnce("git rev-parse --abbrev-ref origin/HEAD 2>/dev/null || true", cwd);
+  if (!raw) return undefined;
+  const match = raw.match(/^origin\/(\S+)$/);
+  return match?.[1];
+}
+
+async function getCurrentBranch(cwd: string): Promise<string | undefined> {
+  return execOnce("git rev-parse --abbrev-ref HEAD 2>/dev/null || true", cwd);
+}
+
+interface GitHubRepo {
+  owner: string;
+  repo: string;
+}
+
+/**
+ * Parse the origin remote URL into owner/repo when it points to GitHub.
+ * Handles HTTPS and SSH formats.
+ */
+async function getGitHubRemote(cwd: string): Promise<GitHubRepo | undefined> {
+  const url = await execOnce("git remote get-url origin 2>/dev/null || true", cwd);
+  if (!url) return undefined;
+
+  const httpsMatch = url.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+?)(?:\.git)?$/);
+  if (httpsMatch) {
+    return { owner: httpsMatch[1]!, repo: httpsMatch[2]! };
+  }
+
+  const sshMatch = url.match(/^git@github\.com:([^/]+)\/([^/]+?)(?:\.git)?$/);
+  if (sshMatch) {
+    return { owner: sshMatch[1]!, repo: sshMatch[2]! };
+  }
+
+  return undefined;
+}
+
+function getGitHubToken(ctx: ToolContext): string | undefined {
+  return ctx.githubToken || process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
+}
+
+/**
+ * Check whether the given branch on a GitHub repo has protection rules.
+ * Returns true if protected, false if unprotected, and undefined if we
+ * can't tell (no token, network error, not GitHub, etc.).
+ */
+async function isBranchProtected(owner: string, repo: string, branch: string, token?: string): Promise<boolean | undefined> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10_000);
+  try {
+    const headers: Record<string, string> = {
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "User-Agent": getUserAgent(),
+    };
+    if (token) headers.Authorization = `Bearer ${token}`;
+
+    const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/branches/${branch}/protection`, {
+      signal: controller.signal,
+      headers,
+    });
+
+    if (res.status === 404) return false; // no protection rules
+    if (res.ok) return true;
+    return undefined; // other error — don't nag
+  } catch {
+    return undefined;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Return a gentle hint when the default branch appears unprotected on GitHub.
+ * Returns undefined when protected, not a GitHub repo, or when we can't tell.
+ */
+async function getBranchProtectionHint(cwd: string, branch: string, ctx: ToolContext): Promise<string | undefined> {
+  const gh = await getGitHubRemote(cwd);
+  if (!gh) return undefined;
+
+  const token = getGitHubToken(ctx);
+  const protected_ = await isBranchProtected(gh.owner, gh.repo, branch, token);
+  if (protected_ === false) {
+    return `Tip: \`${branch}\` doesn't have branch protection rules on GitHub yet. ` +
+      `You may want to enable them to prevent accidental direct pushes. ` +
+      `Want guidance on setting them up? Just ask.`;
+  }
+  return undefined;
+}
+
+export type PushTarget = { kind: "current" } | { kind: "ref"; ref: string } | { kind: "all" } | { kind: "mirror" };
+
+export function parsePushTarget(command: string): PushTarget | undefined {
+  // Strip common shell wrappers so we can look at the git push tokens.
+  const stripped = command.replace(/^\s*(?:\(.*\)\s*&&\s*)?/, "").trim();
+  const tokens = stripped.split(/\s+/);
+  // tokens[0] = git, tokens[1] = push
+  if (tokens[0] !== "git" || tokens[1] !== "push") return undefined;
+
+  let i = 2;
+  const options = new Set<string>();
+  const positional: string[] = [];
+
+  while (i < tokens.length) {
+    const tok = tokens[i]!;
+    if (tok === "--") {
+      i++;
+      while (i < tokens.length) {
+        positional.push(tokens[i]!);
+        i++;
+      }
+      break;
+    }
+    if (tok.startsWith("-")) {
+      if (tok === "--all") options.add("all");
+      else if (tok === "--mirror") options.add("mirror");
+      else if (tok === "--delete" || tok === "-d") options.add("delete");
+      // option may consume next token as its value
+      const needsArg = /^-[A-Za-z]$/.test(tok) && !/[dutq]/.test(tok.charAt(1));
+      i++;
+      if (needsArg && i < tokens.length) i++;
+      continue;
+    }
+    positional.push(tok);
+    i++;
+  }
+
+  if (options.has("all")) return { kind: "all" };
+  if (options.has("mirror")) return { kind: "mirror" };
+
+  // positional: [remote] [refspec ...]
+  const refspecs = positional.slice(1);
+  if (refspecs.length === 0) return { kind: "current" };
+
+  // Use the last refspec; for `git push origin src:dst` we care about dst.
+  const last = refspecs[refspecs.length - 1]!;
+  if (last.includes(":")) {
+    const dst = last.split(":").pop()!;
+    if (!dst) return { kind: "current" }; // e.g. ":branch" is delete
+    return { kind: "ref", ref: dst.replace(/^\+/, "").replace(/^refs\/heads\//, "") };
+  }
+  return { kind: "ref", ref: last.replace(/^refs\/heads\//, "") };
+}
+
 function injectCoauthor(command: string, coauthor?: { name: string; email: string }): string {
   if (!coauthor) return command;
   const trailer = `Co-authored-by: ${coauthor.name} <${coauthor.email}>`;
@@ -141,8 +350,12 @@ function injectCoauthor(command: string, coauthor?: { name: string; email: strin
   return `_KF_BEFORE_HEAD=$(${beforeHead}); (${command}); _KF_EXIT=$?; [ $_KF_EXIT -eq 0 ] && { ${afterCheck}; }; exit $_KF_EXIT`;
 }
 
-function runBash(args: Args, ctx: ToolContext): Promise<ToolOutput> {
+async function runBash(args: Args, ctx: ToolContext): Promise<ToolOutput> {
   const timeout = Math.min(Math.max(1000, args.timeout_ms ?? DEFAULT_TIMEOUT), MAX_TIMEOUT);
+
+  const pushGuard = await guardGitPush(args.command, ctx);
+  if (pushGuard) return pushGuard;
+
   const { shell, args: shellArgs, isPosix } = getShellCommand(ctx.shell);
   const command = isPosix ? injectCoauthor(args.command, ctx.coauthor) : args.command;
 

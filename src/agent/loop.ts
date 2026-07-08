@@ -119,6 +119,10 @@ export interface AgentTurnOpts {
   unifiedBilling?: boolean;
   /** Shell override for the bash tool. If omitted, the tool auto-detects based on platform. */
   shell?: string;
+  /** When false (default), the bash tool blocks `git push` to the default branch. */
+  allowDirectPush?: boolean;
+  /** When true (default), the system prompt instructs the model to prefer PRs over direct pushes. */
+  preferPullRequests?: boolean;
   /** Session-start memory recall promise. If provided, awaited at turn start and injected into messages. */
   sessionStartRecall?: Promise<HybridResult[]>;
   /** Skills DB for semantic skill routing. */
@@ -397,6 +401,7 @@ export async function runAgentTurn(opts: AgentTurnOpts): Promise<void> {
           model: opts.model,
           mode: opts.mode,
           skillContext: skillResult.skillContext,
+          preferPullRequests: opts.preferPullRequests,
         }),
       };
     } else {
@@ -408,6 +413,7 @@ export async function runAgentTurn(opts: AgentTurnOpts): Promise<void> {
           model: opts.model,
           mode: opts.mode,
           skillContext: skillResult.skillContext,
+          preferPullRequests: opts.preferPullRequests,
         }),
       };
     }
@@ -890,6 +896,7 @@ export async function runAgentTurn(opts: AgentTurnOpts): Promise<void> {
               apiToken: opts.apiToken,
               model: opts.model,
               gateway: opts.gateway,
+              allowDirectPush: opts.allowDirectPush,
             },
             opts.onFileChange,
           );
@@ -1258,6 +1265,7 @@ export async function runAgentTurn(opts: AgentTurnOpts): Promise<void> {
             apiToken: opts.apiToken,
             model: opts.model,
             gateway: opts.gateway,
+            allowDirectPush: opts.allowDirectPush,
           },
           opts.onFileChange,
         );

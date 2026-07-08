@@ -34,6 +34,29 @@ async function githubFetch(path: string, token?: string): Promise<unknown> {
   }
 }
 
+async function githubPost(path: string, body: unknown, token?: string): Promise<unknown> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  try {
+    const res = await fetch(`${GITHUB_API_BASE}${path}`, {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        ...getHeaders(token),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`GitHub API ${res.status}: ${res.statusText}${text ? ` — ${text.slice(0, 200)}` : ""}`);
+    }
+    return await res.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function makeOutput(content: string): ToolOutput {
   const bytes = Buffer.byteLength(content, "utf8");
   return { content, rawBytes: bytes, reducedBytes: bytes };
@@ -41,6 +64,11 @@ function makeOutput(content: string): ToolOutput {
 
 function getToken(ctx: ToolContext): string | undefined {
   return ctx.githubToken || process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
+}
+
+function formatError(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  return String(err);
 }
 
 // ─── github_list_merged_prs ──────────────────────────────────────────────────
@@ -356,5 +384,88 @@ export const githubReadCodeTool: ToolSpec<ReadCodeArgs> = {
     }
 
     return makeOutput(`Unexpected response type for ${args.path}`);
+  },
+};
+
+// ─── github_create_pr ────────────────────────────────────────────────────────
+
+interface CreatePrArgs {
+  owner: string;
+  repo: string;
+  title: string;
+  body?: string;
+  head: string;
+  base?: string;
+  draft?: boolean;
+}
+
+export const githubCreatePrTool: ToolSpec<CreatePrArgs> = {
+  name: "github_create_pr",
+  description:
+    "Create a pull request on GitHub. Provide the owner, repo, title, and the head branch " +
+    "(the branch containing your changes). The base branch defaults to the repository's default branch.",
+  parameters: {
+    type: "object",
+    properties: {
+      owner: { type: "string", description: "Repository owner (user or organization)." },
+      repo: { type: "string", description: "Repository name." },
+      title: { type: "string", description: "Pull request title." },
+      body: { type: "string", description: "Pull request description (markdown supported)." },
+      head: { type: "string", description: "Branch containing the changes." },
+      base: { type: "string", description: "Branch to merge into. Defaults to the repository's default branch." },
+      draft: { type: "boolean", description: "Create as a draft pull request." },
+    },
+    required: ["owner", "repo", "title", "head"],
+    additionalProperties: false,
+  },
+  needsPermission: true,
+  render: (args) => ({ title: `Create PR ${args.owner ?? ""}/${args.repo ?? ""}: ${args.title ?? ""}` }),
+  async run(args, ctx): Promise<ToolOutput> {
+    const token = getToken(ctx);
+    let base = args.base;
+    if (!base) {
+      try {
+        const repoInfo = await githubFetch(`/repos/${args.owner}/${args.repo}`, token) as { default_branch: string };
+        base = repoInfo.default_branch;
+      } catch (err) {
+        return makeOutput(`Failed to determine default branch for ${args.owner}/${args.repo}: ${formatError(err)}`);
+      }
+    }
+
+    let pr: {
+      number: number;
+      title: string;
+      html_url: string;
+      state: string;
+      head?: { ref?: string };
+      base?: { ref?: string };
+    };
+    try {
+      pr = await githubPost(
+        `/repos/${args.owner}/${args.repo}/pulls`,
+        {
+          title: args.title,
+          body: args.body ?? "",
+          head: args.head,
+          base,
+          draft: args.draft ?? false,
+        },
+        token,
+      ) as typeof pr;
+    } catch (err) {
+      return makeOutput(`Failed to create PR: ${formatError(err)}`);
+    }
+
+    const branchLine = pr.head?.ref && pr.base?.ref
+      ? `Branch: ${pr.head.ref} → ${pr.base.ref}`
+      : undefined;
+    const content = [
+      `Created PR #${pr.number}: ${pr.title}`,
+      `URL: ${pr.html_url}`,
+      `State: ${pr.state}`,
+      ...(branchLine ? [branchLine] : []),
+    ].join("\n");
+
+    return makeOutput(content);
   },
 };

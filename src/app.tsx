@@ -209,6 +209,8 @@ export interface Cfg {
   autoExecute?: boolean;
   autoFreshSuggestionTurns?: number;
   autoFreshEnabled?: boolean;
+  preferPullRequests?: boolean;
+  allowDirectPush?: boolean;
 }
 function App({
   initialCfg,
@@ -466,7 +468,7 @@ function App({
 
   const cacheStableRef = useRef(initialCfg?.cacheStablePrompts !== false);
   const messagesRef = useRef<ChatMessage[]>(
-    makePrefixMessages(cacheStableRef.current, cfg?.model ?? DEFAULT_MODEL, "edit", ALL_TOOLS),
+    makePrefixMessages(cacheStableRef.current, cfg?.model ?? DEFAULT_MODEL, "edit", ALL_TOOLS, cfg?.preferPullRequests),
   );
   const executorRef = useRef<ToolExecutor>(new ToolExecutor(ALL_TOOLS));
   const activeAsstIdRef = useRef<number | null>(null);
@@ -744,6 +746,7 @@ function App({
           tools: [...ALL_TOOLS, ...mcpToolsRef.current, ...lspToolsRef.current],
           model: cfg?.model ?? DEFAULT_MODEL,
           mode,
+          preferPullRequests: cfg?.preferPullRequests,
         }),
       };
     } else {
@@ -754,6 +757,7 @@ function App({
           tools: [...ALL_TOOLS, ...mcpToolsRef.current, ...lspToolsRef.current],
           model: cfg?.model ?? DEFAULT_MODEL,
           mode,
+          preferPullRequests: cfg?.preferPullRequests,
         }),
       };
     }
@@ -2259,6 +2263,8 @@ function App({
           providerKeys: cfg.providerKeys,
           providerKeyAliases: cfg.providerKeyAliases,
           unifiedBilling: cfg.unifiedBilling,
+          allowDirectPush: cfg.allowDirectPush,
+          preferPullRequests: cfg.preferPullRequests,
           onIterationEnd,
           intentClassification: classification,
           sessionStartRecall: sessionStartRecallRef.current ?? undefined,
