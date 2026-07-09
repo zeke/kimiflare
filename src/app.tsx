@@ -443,9 +443,17 @@ function App({
     if (!cfg?.cloudMode || !initialCloudToken) return;
     let cancelled = false;
     const fetchBudget = async () => {
+      const did = cloudDeviceId ?? initialCloudDeviceId;
+      // If the user is a paying subscriber, provision/refresh their Pro grant
+      // server-side first so the budget below reflects the lifted cap (works
+      // even if the Stripe webhook never reached the worker).
+      try {
+        const { fetchBillingStatus } = await import("./cloud/billing.js");
+        await fetchBillingStatus(initialCloudToken, did);
+      } catch { /* non-fatal — free-tier users have no subscription */ }
       try {
         const { fetchCloudUsage } = await import("./cloud/auth.js");
-        const usage = await fetchCloudUsage(initialCloudToken, cloudDeviceId ?? initialCloudDeviceId);
+        const usage = await fetchCloudUsage(initialCloudToken, did);
         if (usage && !cancelled) {
           setCloudBudget({ remaining: usage.remaining, limit: usage.input_token_limit });
         }
@@ -488,7 +496,6 @@ function App({
   const usageRef = useRef<Usage | null>(null);
   const gatewayMetaRef = useRef<GatewayMeta | null>(null);
   const lastApiErrorRef = useRef<{ httpStatus?: number; code?: number; message: string } | null>(null);
-  const pendingRetryRef = useRef<{ text: string; display: string } | null>(null);
   const updateCheckedRef = useRef(false);
   const sessionStateRef = useRef<SessionState>(emptySessionState());
   const artifactStoreRef = useRef<ArtifactStore>(new ArtifactStore());
@@ -574,8 +581,13 @@ function App({
         description: c.description ?? "",
         source: c.source,
       }));
-    return [...BUILTIN_COMMANDS, ...customs];
-  }, [customCommandsVersion]);
+    // /upgrade only makes sense on KimiFlare Cloud — surface it in the picker
+    // only when the user is in cloud mode (the handler stays available either way).
+    const cloudCommands: SlashItem[] = cfg?.cloudMode
+      ? [{ name: "upgrade", description: "Upgrade to KimiFlare Pro", source: "builtin" }]
+      : [];
+    return [...BUILTIN_COMMANDS, ...cloudCommands, ...customs];
+  }, [customCommandsVersion, cfg?.cloudMode]);
 
   // Preserves the pre-refactor asymmetry: the picker close-on-modal check
   // includes showInboxModal but EXCLUDES showRemoteDashboard and
@@ -1380,6 +1392,32 @@ function App({
           ...e,
           { kind: "info", key: mkKey(), text: "Complete payment in your browser. Your session will activate automatically." },
         ]);
+        // Poll billing status until the subscription activates, then refresh the
+        // budget in place so the user is recognized as Pro without restarting.
+        void (async () => {
+          const { fetchBillingStatus } = await import("./cloud/billing.js");
+          const { fetchCloudUsage } = await import("./cloud/auth.js");
+          for (let i = 0; i < 40; i++) {
+            await new Promise((r) => setTimeout(r, 5000));
+            let status;
+            try {
+              status = await fetchBillingStatus(token, did);
+            } catch {
+              continue;
+            }
+            if (status && (status.status === "active" || status.status === "past_due")) {
+              try {
+                const usage = await fetchCloudUsage(token, did);
+                if (usage) setCloudBudget({ remaining: usage.remaining, limit: usage.input_token_limit });
+              } catch { /* ignore */ }
+              setEvents((e) => [
+                ...e,
+                { kind: "info", key: mkKey(), text: "✓ KimiFlare Pro is active — your token limit has been upgraded. Thank you!" },
+              ]);
+              return;
+            }
+          }
+        })();
       } else {
         setEvents((e) => [...e, { kind: "error", key: mkKey(), text: "Checkout unavailable. Please try again later." }]);
       }
@@ -1389,7 +1427,7 @@ function App({
         { kind: "error", key: mkKey(), text: `Upgrade failed: ${err instanceof Error ? err.message : String(err)}` },
       ]);
     }
-  }, [cloudToken, cloudDeviceId, initialCloudToken, initialCloudDeviceId, mkKey, setEvents]);
+  }, [cloudToken, cloudDeviceId, initialCloudToken, initialCloudDeviceId, mkKey, setEvents, setCloudBudget]);
 
   const handleSaveProviderKey = useCallback(
     (model: ModelEntry, result: KeyResult) => {
@@ -1641,7 +1679,7 @@ function App({
   );
 
   const processMessage = useCallback(
-    async (text: string, displayText?: string, opts?: { queuedKey?: string; isRetry?: boolean }) => {
+    async (text: string, displayText?: string, opts?: { queuedKey?: string }) => {
       if (!cfg) return;
       let trimmed = text.trim();
       if (!trimmed) return;
@@ -1654,7 +1692,7 @@ function App({
       let overrideEffort: ReasoningEffort | undefined;
       let display = displayText?.trim() || trimmed;
 
-      if (!opts?.isRetry && trimmed.startsWith("/")) {
+      if (trimmed.startsWith("/")) {
         const head = trimmed.split(/\s+/)[0]!.toLowerCase();
         const selfManaged = ["/compact", "/init"].includes(head);
         if (await handleSlash(trimmed)) {
@@ -1732,24 +1770,22 @@ function App({
         }
       }
 
-      if (!opts?.isRetry) {
-        if (opts?.queuedKey) {
-          setEvents((evts) =>
-            evts.map((e) =>
-              e.kind === "user" && e.key === opts.queuedKey
-                ? { ...e, text: display, images: images.length > 0 ? images : undefined, queued: false }
-                : e,
-            ),
-          );
-        } else {
-          setEvents((e) => [...e, { kind: "user", key: mkKey(), text: display, images: images.length > 0 ? images : undefined }]);
-        }
+      if (opts?.queuedKey) {
+        setEvents((evts) =>
+          evts.map((e) =>
+            e.kind === "user" && e.key === opts.queuedKey
+              ? { ...e, text: display, images: images.length > 0 ? images : undefined, queued: false }
+              : e,
+          ),
+        );
+      } else {
+        setEvents((e) => [...e, { kind: "user", key: mkKey(), text: display, images: images.length > 0 ? images : undefined }]);
+      }
 
-        // LSP nudge: if user references code files and LSP is not configured
-        const nudge = maybeLspNudge(display, cfg?.lspEnabled ?? false, cfg?.lspServers ?? {});
-        if (nudge) {
-          setEvents((e) => [...e, { kind: "info", key: mkKey(), text: nudge }]);
-        }
+      // LSP nudge: if user references code files and LSP is not configured
+      const nudge = maybeLspNudge(display, cfg?.lspEnabled ?? false, cfg?.lspServers ?? {});
+      if (nudge) {
+        setEvents((e) => [...e, { kind: "info", key: mkKey(), text: nudge }]);
       }
 
       // M6.1: classify intent EARLY so the tier is available to the
@@ -1758,116 +1794,37 @@ function App({
       // actually configured, so this isn't a duplicate cost.
       const classification = classifyIntent(trimmed);
 
-      if (!opts?.isRetry) {
-        // UserPromptSubmit hook (veto-able). Fired after we know the
-        // prompt resolves to actual user-message content (post slash /
-        // custom command expansion). A vetoing hook cancels the turn
-        // before any LLM call.
-        if (hooksManagerRef.current.hasEnabledHooks("UserPromptSubmit")) {
-          const promptOutcome = await hooksManagerRef.current.fire(
-            "UserPromptSubmit",
-            {
-              event: "UserPromptSubmit",
-              session_id: sessionIdRef.current,
-              cwd: process.cwd(),
-              prompt: display,
-              tier: classification.tier,
-            },
-            null,
-          );
-          if (promptOutcome.vetoed) {
-            const reason = promptOutcome.vetoReason || "UserPromptSubmit hook blocked the prompt";
-            setEvents((e) => [
-              ...e,
-              { kind: "info", key: mkKey(), text: `hook blocked the prompt: ${reason}` },
-            ]);
-            endTurn();
-            return;
-          }
-        }
-
-        messagesRef.current.push({ role: "user", content });
-
-        // Pre-turn save: ensure session exists even if user exits mid-turn
-        await saveSessionSafe();
-
-        // Occasional gentle nudge about /init (educational, not a warning)
-        turnCounterRef.current += 1;
-        if (
-          turnCounterRef.current % 15 === 0 &&
-          existsSync(join(process.cwd(), "KIMI.md")) &&
-          !kimiMdStale
-        ) {
+      // UserPromptSubmit hook (veto-able). Fired after we know the
+      // prompt resolves to actual user-message content (post slash /
+      // custom command expansion). A vetoing hook cancels the turn
+      // before any LLM call.
+      if (hooksManagerRef.current.hasEnabledHooks("UserPromptSubmit")) {
+        const promptOutcome = await hooksManagerRef.current.fire(
+          "UserPromptSubmit",
+          {
+            event: "UserPromptSubmit",
+            session_id: sessionIdRef.current,
+            cwd: process.cwd(),
+            prompt: display,
+            tier: classification.tier,
+          },
+          null,
+        );
+        if (promptOutcome.vetoed) {
+          const reason = promptOutcome.vetoReason || "UserPromptSubmit hook blocked the prompt";
           setEvents((e) => [
             ...e,
-            { kind: "info", key: mkKey(), text: "Tip: Rerunning /init occasionally helps KimiFlare stay accurate as your project evolves." },
+            { kind: "info", key: mkKey(), text: `hook blocked the prompt: ${reason}` },
           ]);
-        }
-
-        // Auto-fresh suggestion for long auto/edit sessions
-        const autoFreshThreshold = cfg?.autoFreshSuggestionTurns ?? DEFAULT_AUTO_FRESH_SUGGESTION_TURNS;
-        if (
-          autoFreshThreshold > 0 &&
-          turnCounterRef.current >= autoFreshThreshold &&
-          (modeRef.current === "auto" || modeRef.current === "edit" || modeRef.current === "multi-agent-experimental") &&
-          !freshSuggestedRef.current
-        ) {
-          freshSuggestedRef.current = true;
-          if (cfg?.autoFreshEnabled) {
-            // Auto-execute /fresh after a silent checkpoint
-            void (async () => {
-              try {
-                const turnIndex = messagesRef.current.length;
-                if (turnIndex > 0) {
-                  const cp: Checkpoint = {
-                    id: `cp_prefresh_${Date.now()}`,
-                    label: "pre-fresh auto-save",
-                    turnIndex,
-                    timestamp: new Date().toISOString(),
-                    sessionState: compiledContextRef.current ? sessionStateRef.current : undefined,
-                    artifactStore: serializeArtifactStore(artifactStoreRef.current),
-                  };
-                  ensureSessionId();
-                  const { sessionsDir } = await import("./sessions.js");
-                  const filePath = join(sessionsDir(), `${sessionIdRef.current}.json`);
-                  await addCheckpoint(filePath, cp);
-                }
-                const summary = await generateContinuationSummary({
-                  messages: messagesRef.current,
-                  mode: modeRef.current,
-                  accountId: cfg.accountId,
-                  apiToken: cfg.apiToken,
-                  model: cfg.plumbingModel ?? "@cf/moonshotai/kimi-k2.5",
-                  gateway: gatewayFromConfig(cfg),
-                  memoryManager: memoryManagerRef.current,
-                  memoryEnabled: cfg.memoryEnabled,
-                });
-                if (summary) {
-                  executeFreshStart(buildSlashContext(), summary);
-                  setEvents((e) => [
-                    ...e,
-                    { kind: "info", key: mkKey(), text: "Auto-fresh triggered: starting new session with continuation context…" },
-                  ]);
-                }
-              } catch (e) {
-                setEvents((es) => [
-                  ...es,
-                  { kind: "error", key: mkKey(), text: `Auto-fresh failed: ${(e as Error).message}` },
-                ]);
-              }
-            })();
-          } else {
-            setEvents((e) => [
-              ...e,
-              {
-                kind: "info",
-                key: mkKey(),
-                text: `Session has run for ${turnCounterRef.current} turns. The model may slow down with accumulated context. Run /fresh to continue with a summarized state, or /compact to compress history.`,
-              },
-            ]);
-          }
+          endTurn();
+          return;
         }
       }
+
+      messagesRef.current.push({ role: "user", content });
+
+      // Pre-turn save: ensure session exists even if user exits mid-turn
+      await saveSessionSafe();
 
       // Recall artifacts before sending if compiled context is enabled
       if (compiledContextRef.current) {
@@ -1879,6 +1836,83 @@ function App({
             ...sessionStateRef.current,
             artifact_index: { ...sessionStateRef.current.artifact_index },
           };
+        }
+      }
+
+      // Occasional gentle nudge about /init (educational, not a warning)
+      turnCounterRef.current += 1;
+      if (
+        turnCounterRef.current % 15 === 0 &&
+        existsSync(join(process.cwd(), "KIMI.md")) &&
+        !kimiMdStale
+      ) {
+        setEvents((e) => [
+          ...e,
+          { kind: "info", key: mkKey(), text: "Tip: Rerunning /init occasionally helps KimiFlare stay accurate as your project evolves." },
+        ]);
+      }
+
+      // Auto-fresh suggestion for long auto/edit sessions
+      const autoFreshThreshold = cfg?.autoFreshSuggestionTurns ?? DEFAULT_AUTO_FRESH_SUGGESTION_TURNS;
+      if (
+        autoFreshThreshold > 0 &&
+        turnCounterRef.current >= autoFreshThreshold &&
+        (modeRef.current === "auto" || modeRef.current === "edit" || modeRef.current === "multi-agent-experimental") &&
+        !freshSuggestedRef.current
+      ) {
+        freshSuggestedRef.current = true;
+        if (cfg?.autoFreshEnabled) {
+          // Auto-execute /fresh after a silent checkpoint
+          void (async () => {
+            try {
+              const turnIndex = messagesRef.current.length;
+              if (turnIndex > 0) {
+                const cp: Checkpoint = {
+                  id: `cp_prefresh_${Date.now()}`,
+                  label: "pre-fresh auto-save",
+                  turnIndex,
+                  timestamp: new Date().toISOString(),
+                  sessionState: compiledContextRef.current ? sessionStateRef.current : undefined,
+                  artifactStore: serializeArtifactStore(artifactStoreRef.current),
+                };
+                ensureSessionId();
+                const { sessionsDir } = await import("./sessions.js");
+                const filePath = join(sessionsDir(), `${sessionIdRef.current}.json`);
+                await addCheckpoint(filePath, cp);
+              }
+              const summary = await generateContinuationSummary({
+                messages: messagesRef.current,
+                mode: modeRef.current,
+                accountId: cfg.accountId,
+                apiToken: cfg.apiToken,
+                model: cfg.plumbingModel ?? "@cf/moonshotai/kimi-k2.5",
+                gateway: gatewayFromConfig(cfg),
+                memoryManager: memoryManagerRef.current,
+                memoryEnabled: cfg.memoryEnabled,
+              });
+              if (summary) {
+                executeFreshStart(buildSlashContext(), summary);
+                setEvents((e) => [
+                  ...e,
+                  { kind: "info", key: mkKey(), text: "Auto-fresh triggered: starting new session with continuation context…" },
+                ]);
+              }
+            } catch (e) {
+              setEvents((es) => [
+                ...es,
+                { kind: "error", key: mkKey(), text: `Auto-fresh failed: ${(e as Error).message}` },
+              ]);
+            }
+          })();
+        } else {
+          setEvents((e) => [
+            ...e,
+            {
+              kind: "info",
+              key: mkKey(),
+              text: `Session has run for ${turnCounterRef.current} turns. The model may slow down with accumulated context. Run /fresh to continue with a summarized state, or /compact to compress history.`,
+            },
+          ]);
         }
       }
 
@@ -2299,7 +2333,6 @@ function App({
         },
         {
           onDone: () => {
-            pendingRetryRef.current = null;
             // Fire-and-forget all post-turn housekeeping so the UI returns to
             // idle immediately and the user can type the next message without
             // waiting for compaction, memory recall, or session persistence.
@@ -2618,7 +2651,6 @@ function App({
             ) {
               const err = { httpStatus: e.httpStatus, code: e.code, message: humanizeCloudflareError(e) };
               lastApiErrorRef.current = err;
-              pendingRetryRef.current = { text: trimmed, display };
               setEvents((es) => [
                 ...es,
                 { kind: "api_error", key: mkKey(), ...err },
@@ -3007,17 +3039,6 @@ function App({
     );
   }
 
-  const handleRetry = useCallback(
-    (eventKey: string) => {
-      const pending = pendingRetryRef.current;
-      if (!pending) return;
-      pendingRetryRef.current = null;
-      setEvents((es) => es.filter((e) => e.key !== eventKey));
-      void processMessage(pending.text, pending.display, { isRetry: true });
-    },
-    [processMessage],
-  );
-
   const hasConversation = events.some((e) => e.kind === "user" || e.kind === "assistant");
 
   return (
@@ -3026,7 +3047,7 @@ function App({
         {!hasConversation && events.length === 0 ? (
           <Welcome />
         ) : (
-          <ChatView events={events} showReasoning={showReasoning} verbose={verbose} intentTier={intentTier ?? undefined} onUpgrade={handleUpgrade} onRetry={handleRetry} />
+          <ChatView events={events} showReasoning={showReasoning} verbose={verbose} intentTier={intentTier ?? undefined} onUpgrade={handleUpgrade} />
         )}
         {perm ? (
           <PermissionModal
